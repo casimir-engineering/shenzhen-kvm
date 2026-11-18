@@ -1,0 +1,16 @@
+[Unit]
+Description=Shenzhen KVM: keyboard, mouse and clipboard shared with another computer
+After=network.target systemd-udevd.service
+
+[Service]
+# Until this computer is linked with another one (shenzhen-kvm visible / link, or the tray app) it
+# only listens for the tray app and the command line, and uses no CPU.
+ExecStart=/usr/local/bin/shenzhen-kvm run
+Restart=always
+RestartSec=2
+Nice=-10
+KillMode=control-group
+TimeoutStopSec=5
+
+[Install]
+WantedBy=multi-user.target

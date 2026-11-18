@@ -1,0 +1,1140 @@
+#!/usr/bin/env python3
+"""Shenzhen KVM for the Linux desktop: a tray icon and one window.
+
+It talks to the shenzhen-kvm service (which runs as root) over the service's control socket:
+newline-delimited JSON both ways. It subscribes to the service's state and sends the person's
+choices back. It only needs python3-gi and gir1.2-gtk-3.0 (no cairo bindings: the tray glyphs
+are drawn pixel by pixel).
+
+    shenzhen-kvm-tray [--socket PATH] [--screenshot OUT.png]
+"""
+import argparse
+import hashlib
+import json
+import math
+import os
+import signal
+import socket
+import sys
+import time
+import warnings
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import GdkPixbuf, GLib, GObject, Gdk, Gtk  # noqa: E402
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)   # Gtk.StatusIcon is deprecated but is what XEmbed trays show
+
+APP = "Shenzhen KVM"
+NOT_RUNNING = "Shenzhen KVM isn't running on this computer."
+RED = "#ed333b"
+
+
+# ---------------------------------------------------------------------------------------------
+# Words
+# ---------------------------------------------------------------------------------------------
+def size_text(b):
+    b = int(b)
+    if b >= 1 << 30:
+        return "%.1f GB" % (b / float(1 << 30))
+    if b >= 1 << 20:
+        return "%.1f MB" % (b / float(1 << 20))
+    if b >= 1024:
+        return "%d KB" % (b >> 10)
+    return "%d bytes" % b
+
+
+def esc(s):
+    return GLib.markup_escape_text(s or "")
+
+
+class Peer:
+    """The other computer's name, for the middle of a sentence and for its start."""
+
+    def __init__(self, name):
+        self.name = name or ""
+
+    @property
+    def mid(self):
+        return self.name or "the other computer"
+
+    @property
+    def start(self):
+        return self.name or "The other computer"
+
+
+def window_status(st, refused):
+    if st is None:
+        return refused or NOT_RUNNING
+    p = Peer(st.get("peer_name"))
+    s = st.get("settings") or {}
+    if not st.get("linked"):
+        return "Not linked with another computer yet."
+    if not s.get("sharing", True):
+        return "Sharing is off: your keyboard, mouse and clipboard stay on this computer."
+    mode = st.get("mode")
+    if mode == "driving":
+        return "The mouse is on %s." % p.mid
+    if mode == "driven":
+        return "%s's keyboard and mouse are in use here." % p.start
+    if st.get("online"):
+        return "The mouse is on this computer. %s is connected." % p.start
+    return "The mouse is on this computer. %s is not answering: check that it is on and on the same network." % p.start
+
+
+def short_status(st, refused):
+    if st is None:
+        return refused or NOT_RUNNING
+    p = Peer(st.get("peer_name"))
+    s = st.get("settings") or {}
+    if not st.get("linked"):
+        return "Not linked yet"
+    mode = st.get("mode")
+    if mode == "driving":
+        return "Mouse is on %s" % p.mid
+    if mode == "driven":
+        return "Mouse is on this computer (%s's mouse)" % p.mid
+    if not s.get("sharing", True):
+        return "Sharing is off"
+    if st.get("online"):
+        return "Mouse is on this computer · %s connected" % p.mid
+    return "Mouse is on this computer · %s not answering" % p.mid
+
+
+def direction(t, p):
+    return ("This computer → %s" % p.mid) if t.get("dir") == "out" else ("%s → this computer" % p.start)
+
+
+def fraction(t):
+    total, done = t.get("total") or 0, t.get("done") or 0
+    if total > 0:
+        return min(1.0, float(done) / total)
+    return 1.0 if t.get("state") == "done" else 0.0
+
+
+# ---------------------------------------------------------------------------------------------
+# Tray glyphs, drawn without cairo: signed distances, anti-aliased by coverage
+# ---------------------------------------------------------------------------------------------
+def _sd_box(px, py, x0, y0, x1, y1, r):
+    cx, cy, hw, hh = (x0 + x1) / 2, (y0 + y1) / 2, (x1 - x0) / 2, (y1 - y0) / 2
+    qx, qy = abs(px - cx) - hw + r, abs(py - cy) - hh + r
+    return math.hypot(max(qx, 0.0), max(qy, 0.0)) + min(max(qx, qy), 0.0) - r
+
+
+def _sd_circle(px, py, cx, cy, r):
+    return math.hypot(px - cx, py - cy) - r
+
+
+def _sd_capsule(px, py, ax, ay, bx, by, r):
+    pax, pay, bax, bay = px - ax, py - ay, bx - ax, by - ay
+    h = max(0.0, min(1.0, (pax * bax + pay * bay) / (bax * bax + bay * bay or 1e-9)))
+    return math.hypot(pax - bax * h, pay - bay * h) - r
+
+
+def _keyboard_layout(width, x, y):
+    """A keyboard on whole pixels (so it stays crisp at tray sizes), width pixels wide at most."""
+    lw = 1 if width < 28 else 2 if width < 44 else int(round(width / 20.0))   # outline
+    key = max(1, int(round(width / 11.0)))
+    gap = max(1, int(round(width / 18.0)))
+    n = max(3, min(6, (width - 2 - 2 * lw - gap) // (key + gap)))
+    ow = gap + n * (key + gap) + 2 * lw
+    oh = 4 * gap + 3 * key + 2 * lw
+    x0 = x + (width - ow) // 2
+    box = (x0, y, x0 + ow, y + oh)
+    keys = []
+    kx0, ky0 = x0 + lw + gap, y + lw + gap
+    for row in range(2):
+        for c in range(n):
+            kx, ky = kx0 + c * (key + gap), ky0 + row * (key + gap)
+            keys.append((kx, ky, kx + key, ky + key))
+    sy = ky0 + 2 * (key + gap)
+    keys.append((kx0 + (key + gap), sy, kx0 + (n - 1) * (key + gap) - gap, sy + key))
+    return box, lw, keys
+
+
+def _keyboard(px, py, layout, filled):
+    box, lw, keys = layout
+    r = lw + 0.6
+    keys_d = min(_sd_box(px, py, k[0], k[1], k[2], k[3], 0.0) for k in keys)
+    outer = _sd_box(px, py, box[0], box[1], box[2], box[3], r)
+    if filled:
+        return max(outer, -keys_d)
+    inner = _sd_box(px, py, box[0] + lw, box[1] + lw, box[2] - lw, box[3] - lw, max(0.0, r - lw))
+    return min(max(outer, -inner), keys_d)
+
+
+def glyph_sdf(kind, s):
+    if kind == "warning":
+        lw = max(1.5, s * 0.085)
+        a, b, c = (0.5 * s, 0.10 * s), (0.07 * s, 0.88 * s), (0.93 * s, 0.88 * s)
+
+        def f(px, py):
+            d = min(_sd_capsule(px, py, a[0], a[1], b[0], b[1], lw / 2),
+                    _sd_capsule(px, py, b[0], b[1], c[0], c[1], lw / 2),
+                    _sd_capsule(px, py, c[0], c[1], a[0], a[1], lw / 2))
+            d = min(d, _sd_capsule(px, py, 0.5 * s, 0.40 * s, 0.5 * s, 0.60 * s, lw * 0.5))
+            return min(d, _sd_circle(px, py, 0.5 * s, 0.74 * s, lw * 0.6))
+        return f
+    if kind == "badge":
+        lay = _keyboard_layout(int(round(s * 0.84)), 0, int(round(s * 0.10)))
+        br = s * 0.26
+        bx = by = s - br - 0.25
+        dot = max(0.7, s * 0.045)
+
+        def f(px, py):
+            kb = max(_keyboard(px, py, lay, False), -_sd_circle(px, py, bx, by, br + max(1.0, s * 0.07)))
+            disk = _sd_circle(px, py, bx, by, br)
+            dots = min(_sd_circle(px, py, bx + o * br * 0.5, by, dot) for o in (-1, 0, 1))
+            return min(kb, max(disk, -dots))
+        return f
+    width = s - max(1, s // 12) * 2 + 1
+    lay = _keyboard_layout(width, (s - width + 1) // 2, 0)
+    h = lay[0][3] - lay[0][1]
+    lay = _keyboard_layout(width, (s - width + 1) // 2, (s - h) // 2)
+    filled = kind == "filled"
+    return lambda px, py: _keyboard(px, py, lay, filled)
+
+
+def draw_glyph(kind, size, rgba):
+    """kind: outline | filled | badge | warning. Returns a GdkPixbuf of size x size in colour rgba."""
+    s = max(8, int(size))
+    f = glyph_sdf(kind, s)
+    r, g, b = [int(round(max(0.0, min(1.0, c)) * 255)) for c in (rgba.red, rgba.green, rgba.blue)]
+    a_max = max(0.0, min(1.0, rgba.alpha))
+    buf = bytearray(s * s * 4)
+    i = 0
+    for y in range(s):
+        for x in range(s):
+            cov = 0.5 - f(x + 0.5, y + 0.5)
+            cov = 0.0 if cov < 0 else 1.0 if cov > 1 else cov
+            buf[i:i + 4] = bytes((r, g, b, int(cov * a_max * 255 + 0.5)))
+            i += 4
+    return GdkPixbuf.Pixbuf.new_from_bytes(GLib.Bytes.new(bytes(buf)), GdkPixbuf.Colorspace.RGB, True, 8, s, s, s * 4)
+
+
+# ---------------------------------------------------------------------------------------------
+# The connection to the service
+# ---------------------------------------------------------------------------------------------
+class Service:
+    def __init__(self, path, on_state, on_change, on_lost):
+        self.path, self.on_state, self.on_change, self.on_lost = path, on_state, on_change, on_lost
+        self.sock, self.watch, self.buf = None, None, b""
+        self.refused = None          # the service's message when it does not let us in
+        self.looking = False         # what we last told this connection
+        self.want_look = False
+        GLib.idle_add(self._try)
+
+    @property
+    def up(self):
+        return self.sock is not None
+
+    def _try(self):
+        if self.sock:
+            return False
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(2)
+        try:
+            s.connect(self.path)
+        except OSError:
+            s.close()
+            GLib.timeout_add(1000, self._try)
+            return False
+        self.sock, self.buf, self.looking = s, b"", False
+        self.watch = GLib.io_add_watch(s.fileno(), GLib.PRIORITY_DEFAULT, GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, self._readable)
+        self.send({"cmd": "subscribe"})
+        self.sync_look()
+        return False
+
+    def _down(self):
+        if self.watch:
+            GLib.source_remove(self.watch)
+        if self.sock:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+        self.sock, self.watch, self.buf, self.looking = None, None, b"", False
+        self.on_lost()
+        GLib.timeout_add(5000 if self.refused else 1000, self._try)
+
+    def _readable(self, fd, cond):
+        try:
+            data = self.sock.recv(65536)
+        except (BlockingIOError, socket.timeout):
+            return True
+        except OSError:
+            data = b""
+        if not data:
+            self.watch = None
+            self._down()
+            return False
+        self.buf += data
+        while b"\n" in self.buf:
+            line, self.buf = self.buf.split(b"\n", 1)
+            try:
+                msg = json.loads(line.decode("utf-8", "replace"))
+            except ValueError:
+                continue
+            if msg.get("type") == "error":
+                self.refused = msg.get("message") or "Shenzhen KVM didn't let this app in."
+                self.on_change()
+            elif msg.get("type") == "state":
+                self.refused = None
+                self.on_state(msg)
+        return True
+
+    def send(self, obj):
+        if not self.sock:
+            return
+        try:
+            self.sock.sendall((json.dumps(obj) + "\n").encode())
+        except OSError:
+            pass
+
+    def sync_look(self):
+        if self.sock and self.want_look != self.looking:
+            self.looking = self.want_look
+            self.send({"cmd": "look", "on": self.want_look})
+
+    def close(self):
+        if self.sock:
+            self.want_look = False
+            self.sync_look()
+
+
+# ---------------------------------------------------------------------------------------------
+# Small widget helpers
+# ---------------------------------------------------------------------------------------------
+def label(text="", secondary=False, small=False, bold=False, wrap=True, markup=None):
+    l = Gtk.Label()
+    l.set_xalign(0)
+    l.set_line_wrap(wrap)
+    if wrap:
+        l.set_line_wrap_mode(2)   # Pango.WrapMode.WORD_CHAR
+        l.set_max_width_chars(1)   # the column's width decides where it wraps
+    if secondary:
+        l.get_style_context().add_class("dim-label")
+    l._fmt = (small, bold)
+    if markup is not None:
+        l.set_markup(markup)
+    else:
+        set_text(l, text)
+    return l
+
+
+def set_text(l, text):
+    small, bold = getattr(l, "_fmt", (False, False))
+    m = esc(text)
+    if bold:
+        m = "<b>%s</b>" % m
+    if small:
+        m = "<small>%s</small>" % m
+    if l.get_label() != m or not l.get_use_markup():
+        l.set_markup(m)
+
+
+def hbox(*kids, spacing=8):
+    b = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=spacing)
+    for k in kids:
+        b.pack_start(k, False, False, 0)
+    return b
+
+
+def vbox(spacing=10):
+    return Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=spacing)
+
+
+def wrap_check(text=""):
+    c = Gtk.CheckButton()
+    l = label(text)
+    c.add(l)
+    c._label = l
+    return c
+
+
+def show_if(w, on):
+    if on and not w.get_visible():
+        w.show()
+    elif not on and w.get_visible():
+        w.hide()
+
+
+def app_icons():
+    """The app icon at every size we ship: from the icon theme once installed, else next to this script."""
+    theme = Gtk.IconTheme.get_default()
+    if theme.has_icon("shenzhen-kvm"):
+        return "shenzhen-kvm", []
+    here = os.path.dirname(os.path.realpath(__file__))
+    out = []
+    for d in (os.path.join(here, "files", "icons"), "/usr/local/share/shenzhen-kvm/icons", "/usr/share/shenzhen-kvm/icons"):
+        for n in (16, 24, 32, 48, 64, 128, 256):
+            p = os.path.join(d, "shenzhen-kvm-%d.png" % n)
+            if os.path.exists(p):
+                try:
+                    out.append(GdkPixbuf.Pixbuf.new_from_file(p))
+                except GLib.Error:
+                    pass
+        if out:
+            break
+    return None, out
+
+
+# ---------------------------------------------------------------------------------------------
+# The app
+# ---------------------------------------------------------------------------------------------
+class App:
+    def __init__(self, sock_path, screenshot=None):
+        self.screenshot = screenshot
+        self.st = None
+        self.updating = False
+        self.dialog, self.dialog_key, self.forget_dialog = None, None, None
+        self.first_seen = {}              # transfer id -> (time, done) when progress was first seen
+        self.visible_deadline = 0.0
+        self.found_key = None
+        self.xfer_rows = {}
+        self.icon_name, self.icon_list = app_icons()
+        if self.icon_name:
+            Gtk.Window.set_default_icon_name(self.icon_name)
+        elif self.icon_list:
+            Gtk.Window.set_default_icon_list(self.icon_list)
+        self.build_window()
+        self.tray = None if screenshot else Tray(self)
+        self.svc = Service(sock_path, self.on_state, self.refresh, self.on_lost)
+        GLib.timeout_add(1000, self.tick)
+        GLib.timeout_add(120, self.pulse)
+        self.refresh()
+
+    # --- the window ---------------------------------------------------------------------------
+    def build_window(self):
+        if self.screenshot:
+            self.win = Gtk.OffscreenWindow()
+        else:
+            self.win = Gtk.Window(title=APP)
+            self.win.set_resizable(False)
+            self.win.set_position(Gtk.WindowPosition.CENTER)
+            self.win.connect("delete-event", lambda w, e: w.hide() or True)
+            self.win.connect("map", lambda w: self.window_shown())
+            self.win.connect("unmap", lambda w: self.window_shown())
+        self.win.set_size_request(540, -1)
+
+        col = vbox(10)
+        col.set_margin_top(20)
+        col.set_margin_bottom(20)
+        col.set_margin_start(24)
+        col.set_margin_end(24)
+        col.set_size_request(492, -1)
+        self.win.add(col)
+        self.col = col
+
+        # 1. header
+        title = Gtk.Label()
+        title.set_markup('<span size="x-large" weight="bold">%s</span>' % APP)
+        title.set_xalign(0)
+        self.sharing = Gtk.Switch()
+        self.sharing.set_valign(Gtk.Align.CENTER)
+        self.sharing.connect("notify::active", self.changed_sharing)
+        head = Gtk.Box(spacing=8)
+        head.pack_start(title, True, True, 0)
+        self.sharing_label = Gtk.Label(label="Sharing")
+        head.pack_end(self.sharing, False, False, 0)
+        head.pack_end(self.sharing_label, False, False, 0)
+        col.pack_start(head, False, False, 0)
+
+        # 2. status
+        self.status = label(secondary=True)
+        self.error = label(secondary=True)
+        col.pack_start(self.status, False, False, 0)
+        col.pack_start(self.error, False, False, 0)
+
+        # 3. linking
+        self.link_sep = Gtk.Separator()
+        col.pack_start(self.link_sep, False, False, 0)
+        self.unlinked = vbox(8)
+        self.unlinked.pack_start(label("Link with another computer", bold=True), False, False, 0)
+        self.unlinked.pack_start(label("On both computers, open Shenzhen KVM. Make one of them visible, then choose it on the other."), False, False, 0)
+        self.visible_btn = Gtk.Button(label="Make this computer visible")
+        self.visible_btn.connect("clicked", lambda b: self.svc.send({"cmd": "visible", "on": True}))
+        self.visible_btn_row = hbox(self.visible_btn)
+        self.unlinked.pack_start(self.visible_btn_row, False, False, 0)
+        self.visible_line = label(wrap=False)
+        stop = Gtk.Button(label="Stop")
+        stop.connect("clicked", lambda b: self.svc.send({"cmd": "visible", "on": False}))
+        self.visible_row = hbox(self.visible_line, stop)
+        self.visible_hint = label(secondary=True, small=True)
+        self.visible_box = vbox(4)
+        self.visible_box.pack_start(self.visible_row, False, False, 0)
+        self.visible_box.pack_start(self.visible_hint, False, False, 0)
+        self.unlinked.pack_start(self.visible_box, False, False, 0)
+        self.unlinked.pack_start(label("Visible computers:"), False, False, 0)
+        self.found_box = vbox(4)
+        self.found_box.set_margin_start(12)
+        self.unlinked.pack_start(self.found_box, False, False, 0)
+        self.found_empty = label("Looking for visible computers on this network…", secondary=True)
+        self.found_empty.set_margin_start(12)
+        self.unlinked.pack_start(self.found_empty, False, False, 0)
+        col.pack_start(self.unlinked, False, False, 0)
+
+        self.session_line = label(wrap=True)
+        self.session_cancel = Gtk.Button(label="Cancel")
+        self.session_cancel.connect("clicked", lambda b: self.svc.send({"cmd": "cancel"}))
+        self.session_row = Gtk.Box(spacing=8)
+        self.session_row.pack_start(self.session_line, True, True, 0)
+        self.session_row.pack_start(self.session_cancel, False, False, 0)
+        col.pack_start(self.session_row, False, False, 0)
+
+        self.linked_line = label(wrap=False)
+        self.forget_btn = Gtk.Button()
+        self.forget_btn.connect("clicked", lambda b: self.ask_forget())
+        self.linked_row = Gtk.Box(spacing=8)
+        self.linked_row.pack_start(self.linked_line, True, True, 0)
+        self.linked_row.pack_end(self.forget_btn, False, False, 0)
+        col.pack_start(self.linked_row, False, False, 0)
+
+        # 4. settings
+        self.settings_sep = Gtk.Separator()
+        col.pack_start(self.settings_sep, False, False, 0)
+        self.settings = vbox(8)
+        self.i_drive = wrap_check()
+        self.i_drive.connect("toggled", lambda c: self.set_setting("i_drive_peer", c.get_active()))
+        self.peer_drives = wrap_check()
+        self.peer_drives.connect("toggled", lambda c: self.set_setting("peer_drives_me", c.get_active()))
+        self.edge = Gtk.ComboBoxText()
+        for k, t in (("top", "above this computer"), ("bottom", "below this computer"),
+                     ("left", "to the left of this computer"), ("right", "to the right of this computer")):
+            self.edge.append(k, t)
+        self.edge.connect("changed", lambda c: c.get_active_id() and self.set_setting("edge", c.get_active_id()))
+        self.edge_label = label(wrap=False)
+        self.edge_hint = label(secondary=True, small=True)
+        self.command = Gtk.ComboBoxText()
+        self.command.append("control", "Control (⌘C copies)")
+        self.command.append("super", "Super")
+        self.command.connect("changed", lambda c: c.get_active_id() and self.set_setting("command_as", c.get_active_id()))
+        self.command_label = label(wrap=False)
+        self.clipboard = wrap_check("Shared clipboard: copy on one computer, paste on the other")
+        self.clipboard.connect("toggled", lambda c: self.set_setting("clipboard", c.get_active()))
+        self.usual = wrap_check("Use the usual copy and paste (Ctrl+C / Ctrl+V) between the two computers")
+        self.usual.connect("toggled", lambda c: self.set_setting("usual_shortcuts", c.get_active()))
+        self.keys_hint = label(secondary=True)
+        self.keys_hint.set_margin_start(26)
+        self.big = wrap_check("Send copied files of any size")
+        self.big.connect("toggled", lambda c: self.set_setting("big_files", c.get_active()))
+        self.limit = Gtk.Entry()
+        self.limit.set_width_chars(6)
+        self.limit.set_alignment(1.0)
+        self.limit.set_input_purpose(Gtk.InputPurpose.DIGITS)
+        self.limit.connect("activate", lambda e: self.apply_limit())
+        self.limit.connect("focus-out-event", lambda e, ev: self.apply_limit() and False)
+        self.limit_row = hbox(label("Files bigger than", wrap=False), self.limit, label("MB are not sent.", wrap=False))
+        self.limit_row.set_margin_start(26)
+        for w in (self.i_drive, self.peer_drives, hbox(self.edge_label, self.edge), self.edge_hint,
+                  hbox(self.command_label, self.command), Gtk.Separator(),
+                  self.clipboard, self.usual, self.keys_hint, self.big, self.limit_row):
+            self.settings.pack_start(w, False, False, 0)
+        col.pack_start(self.settings, False, False, 0)
+
+        # 5. transfers
+        self.xfer_sep = Gtk.Separator()
+        col.pack_start(self.xfer_sep, False, False, 0)
+        self.xfer_title = label("Clipboard transfers", bold=True)
+        col.pack_start(self.xfer_title, False, False, 0)
+        self.xfer_box = vbox(8)
+        col.pack_start(self.xfer_box, False, False, 0)
+
+        # 6. footer
+        col.pack_start(Gtk.Separator(), False, False, 0)
+        col.pack_start(label("Press both Shift keys at once to bring the mouse back to this computer.", secondary=True), False, False, 0)
+
+        col.show_all()
+        self.win.realize() if self.screenshot else None
+
+    def show_window(self):
+        self.refresh()
+        self.win.present()
+
+    def window_shown(self):
+        self.update_look()
+
+    def update_look(self):
+        st = self.st
+        want = bool(st and not st.get("linked") and self.win.get_mapped() and not self.screenshot)
+        self.svc.want_look = want
+        self.svc.sync_look()
+
+    # --- state ----------------------------------------------------------------------------------
+    def on_lost(self):
+        # The service restarts itself after linking or forgetting: wait a moment before saying it isn't running.
+        if self.st is None:
+            self.refresh()
+            return
+        self.col.set_sensitive(False)
+        GLib.timeout_add(2500, self.lost_for_good)
+
+    def lost_for_good(self):
+        if not self.svc.up:
+            self.on_state(None)
+        return False
+
+    def on_state(self, st):
+        self.st = st
+        self.col.set_sensitive(True)
+        if st:
+            left = st.get("visible_left") or 0
+            self.visible_deadline = time.monotonic() + left if left > 0 else 0.0
+            now = time.monotonic()
+            live = set()
+            for t in st.get("transfers") or []:
+                live.add(t.get("id"))
+                if t.get("state") == "running" and t.get("id") not in self.first_seen:
+                    self.first_seen[t.get("id")] = (now, t.get("done") or 0)
+            for k in list(self.first_seen):
+                if k not in live:
+                    del self.first_seen[k]
+        else:
+            self.visible_deadline = 0.0
+        self.refresh()
+        if self.screenshot and st is not None:
+            GLib.timeout_add(400, self.take_screenshot)
+
+    def set_setting(self, key, value):
+        if self.updating:
+            return
+        self.svc.send({"cmd": "settings", key: value})
+
+    def changed_sharing(self, sw, _p):
+        self.set_setting("sharing", sw.get_active())
+
+    def apply_limit(self):
+        if self.updating or not self.st:
+            return False
+        cur = (self.st.get("settings") or {}).get("file_limit_mb", 100)
+        try:
+            v = int(self.limit.get_text().strip())
+        except ValueError:
+            v = 0
+        if v > 0 and v != cur:
+            self.set_setting("file_limit_mb", v)
+        elif v <= 0:
+            self.limit.set_text(str(cur))
+        return False
+
+    def tick(self):
+        if self.visible_deadline:
+            self.refresh_visible()
+        return True
+
+    def pulse(self):
+        for row in self.xfer_rows.values():
+            if row["indeterminate"] and row["bar"].get_visible():
+                row["bar"].pulse()
+        return True
+
+    # --- drawing the state ------------------------------------------------------------------------
+    def refresh(self):
+        self.updating = True
+        try:
+            self._refresh()
+        finally:
+            self.updating = False
+        if self.tray:
+            self.tray.refresh()
+        self.update_look()
+        self.sync_dialogs()
+
+    def _refresh(self):
+        st, refused = self.st, self.svc.refused if hasattr(self, "svc") else None
+        up = st is not None
+        p = Peer(st.get("peer_name") if st else "")
+        s = (st or {}).get("settings") or {}
+        linked = bool(st and st.get("linked"))
+        sharing_on = bool(s.get("sharing", True))
+
+        show_if(self.sharing, up)
+        show_if(self.sharing_label, up)
+        if self.sharing.get_active() != sharing_on:
+            self.sharing.set_active(sharing_on)
+        set_text(self.status, window_status(st, refused))
+        err = (st or {}).get("error") or ""
+        set_text(self.error, err)
+        show_if(self.error, bool(err))
+
+        # linking
+        show_if(self.link_sep, up)
+        show_if(self.unlinked, up and not linked)
+        show_if(self.linked_row, linked)
+        if linked:
+            set_text(self.linked_line, "Linked with %s." % p.mid)
+            self.forget_btn.set_label("Forget %s…" % p.mid)
+        lk = (st or {}).get("linking") or {}
+        stage, role = lk.get("stage", "none"), lk.get("role")
+        lp = Peer(lk.get("peer_name"))
+        line, cancel = "", False
+        if stage in ("connecting", "waiting") and role == "asking":
+            line, cancel = "Asking %s…" % lp.mid, True
+        elif stage == "confirm" and lk.get("you_confirmed") and not lk.get("they_confirmed"):
+            line, cancel = "Waiting for %s to confirm…" % lp.mid, True
+        elif stage == "done":
+            line = lk.get("message") or "Linked with %s." % lp.mid
+        elif stage == "failed":
+            line = lk.get("message") or ""
+        set_text(self.session_line, line)
+        show_if(self.session_row, up and bool(line))
+        show_if(self.session_cancel, cancel)
+        busy = stage in ("connecting", "waiting", "confirm")
+        if up and not linked:
+            self.refresh_visible()
+            self.refresh_found(st.get("found") or [], busy)
+
+        # settings
+        show_if(self.settings_sep, linked)
+        show_if(self.settings, linked)
+        if linked:
+            self.settings.set_sensitive(sharing_on)
+            self.i_drive._label.set_text("This computer's keyboard and mouse can control %s" % p.mid)
+            self.peer_drives._label.set_text("%s's keyboard and mouse can control this computer" % p.start)
+            set_text(self.edge_label, "%s's screen is" % p.start)
+            set_text(self.edge_hint, "Move the pointer past that side of your screen to go to %s; it comes back the same way." % p.mid)
+            set_text(self.command_label, "%s's ⌘ key acts here as" % p.start)
+            set_text(self.keys_hint, "Ctrl+Shift+C copies here and sends to %s; Ctrl+Shift+V pastes what %s copied." % (p.mid, p.mid))
+            self.i_drive.set_active(bool(s.get("i_drive_peer", True)))
+            self.peer_drives.set_active(bool(s.get("peer_drives_me", True)))
+            if self.edge.get_active_id() != s.get("edge"):
+                self.edge.set_active_id(s.get("edge") or "top")
+            if self.command.get_active_id() != s.get("command_as"):
+                self.command.set_active_id(s.get("command_as") or "control")
+            clip = bool(s.get("clipboard", True))
+            self.clipboard.set_active(clip)
+            self.usual.set_active(bool(s.get("usual_shortcuts", True)))
+            self.usual.set_sensitive(clip)
+            self.big.set_active(bool(s.get("big_files", True)))
+            self.big.set_sensitive(clip)
+            show_if(self.keys_hint, clip and not s.get("usual_shortcuts", True))
+            show_if(self.limit_row, clip and not s.get("big_files", True))
+            if not self.limit.has_focus():
+                self.limit.set_text(str(s.get("file_limit_mb", 100)))
+
+        # transfers
+        self.refresh_transfers(((st or {}).get("transfers") or [])[:5], p, bool(st and st.get("paste_waiting")))
+
+    def refresh_visible(self):
+        left = max(0, int(math.ceil(self.visible_deadline - time.monotonic()))) if self.visible_deadline else 0
+        show_if(self.visible_btn_row, left == 0)
+        show_if(self.visible_box, left > 0)
+        if left > 0:
+            set_text(self.visible_line, "Visible to computers on this network for %d:%02d" % (left // 60, left % 60))
+            name = (self.st or {}).get("this_name") or ""
+            set_text(self.visible_hint, ("On the other computer, choose “%s”." % name) if name else "")
+            show_if(self.visible_hint, bool(name))
+        else:
+            self.visible_deadline = 0.0
+
+    def refresh_found(self, found, busy):
+        key = (tuple((f.get("id"), f.get("name")) for f in found), busy)
+        show_if(self.found_empty, not found)
+        show_if(self.found_box, bool(found))
+        if key == self.found_key:
+            return
+        self.found_key = key
+        for c in self.found_box.get_children():
+            self.found_box.remove(c)
+        for f in found:
+            name = Gtk.Label(label=f.get("name") or "A computer")
+            name.set_xalign(0)
+            name.set_ellipsize(3)   # Pango.EllipsizeMode.END
+            b = Gtk.Button(label="Link")
+            b.set_sensitive(not busy)
+            fid = f.get("id")
+            b.connect("clicked", lambda _b, i=fid: self.svc.send({"cmd": "link", "id": i}))
+            row = Gtk.Box(spacing=8)
+            row.pack_start(name, True, True, 0)
+            row.pack_end(b, False, False, 0)
+            row.show_all()
+            self.found_box.pack_start(row, False, False, 0)
+
+    def refresh_transfers(self, xs, p, paste_waiting):
+        show_if(self.xfer_sep, bool(xs))
+        show_if(self.xfer_title, bool(xs))
+        show_if(self.xfer_box, bool(xs))
+        ids = [t.get("id") for t in xs]
+        if ids != [r for r in self.xfer_rows] or len(ids) != len(self.xfer_rows):
+            for c in self.xfer_box.get_children():
+                self.xfer_box.remove(c)
+            old, self.xfer_rows = self.xfer_rows, {}
+            for i in ids:
+                row = old.get(i)
+                if not row:
+                    title = label(small=False)
+                    bar = Gtk.ProgressBar()
+                    bar.set_pulse_step(0.08)
+                    detail = label(secondary=True, small=True)
+                    box = vbox(3)
+                    for w in (title, bar, detail):
+                        box.pack_start(w, False, False, 0)
+                    box.show_all()
+                    row = {"box": box, "title": title, "bar": bar, "detail": detail, "indeterminate": False, "red": None}
+                self.xfer_rows[i] = row
+                self.xfer_box.pack_start(row["box"], False, False, 0)
+        now = time.monotonic()
+        for t in xs:
+            row = self.xfer_rows[t.get("id")]
+            state, total, done = t.get("state"), t.get("total") or 0, t.get("done") or 0
+            set_text(row["title"], "%s · %s" % (direction(t, p), t.get("what") or ""))
+            active = state in ("waiting", "running")
+            show_if(row["bar"], active)
+            row["indeterminate"] = state == "waiting" or total == 0
+            if active and not row["indeterminate"]:
+                row["bar"].set_fraction(fraction(t))
+            if state == "waiting":
+                d = "Starting…"
+            elif state == "running":
+                d = ("%d%% · %s of %s" % (int(fraction(t) * 100), size_text(done), size_text(total))) if total > 0 else size_text(done)
+                t0, d0 = self.first_seen.get(t.get("id"), (now, done))
+                if now - t0 > 0.5 and done > d0:
+                    d += " · %s/s" % size_text((done - d0) / (now - t0))
+            elif state == "done":
+                d = "Done · %s" % size_text(total or done)
+            else:
+                d = "Failed: %s" % (t.get("reason") or "it stopped")
+            if paste_waiting and t.get("dir") == "in" and active:
+                d += " · your paste will happen when this is done"
+            if state == "failed":
+                m = '<small><span foreground="%s">%s</span></small>' % (RED, esc(d))
+                if row["detail"].get_label() != m:
+                    row["detail"].set_markup(m)
+                row["detail"].get_style_context().remove_class("dim-label")
+            else:
+                row["detail"].get_style_context().add_class("dim-label")
+                set_text(row["detail"], d)
+
+    # --- dialogs ----------------------------------------------------------------------------------
+    def sync_dialogs(self):
+        if self.screenshot:
+            return
+        st = self.st
+        want = None
+        if st:
+            lk = st.get("linking") or {}
+            if lk.get("stage") == "confirm" and not lk.get("you_confirmed") and lk.get("role") in ("asked", "asking"):
+                want = (lk.get("role"), lk.get("peer_name") or "", lk.get("code") or "")
+        if want != self.dialog_key:
+            if self.dialog:
+                d, self.dialog = self.dialog, None
+                d.destroy()
+            self.dialog_key = want
+            if want:
+                self.dialog = self.code_dialog(*want)
+        if self.forget_dialog and not (st and st.get("linked")):
+            d, self.forget_dialog = self.forget_dialog, None
+            d.destroy()
+
+    def make_dialog(self, parts, buttons, default):
+        """A dialog over the window: parts are Pango markup lines, top to bottom; buttons (text, response, style)."""
+        d = Gtk.Dialog(transient_for=self.win, modal=True, destroy_with_parent=True, title=APP)
+        d.set_resizable(False)
+        box = d.get_content_area()
+        inner = vbox(10)
+        for side in ("top", "bottom", "start", "end"):
+            getattr(inner, "set_margin_" + side)(22 if side != "bottom" else 12)
+        for m in parts:
+            l = Gtk.Label()
+            l.set_markup(m)
+            l.set_xalign(0)
+            l.set_line_wrap(True)
+            l.set_max_width_chars(52)
+            inner.pack_start(l, False, False, 0)
+        box.pack_start(inner, True, True, 0)
+        for text, resp, style in buttons:
+            btn = d.add_button(text, resp)
+            if style:
+                btn.get_style_context().add_class(style)
+        d.set_default_response(default)
+        acts = d.get_action_area()
+        for side in ("bottom", "end", "start"):
+            getattr(acts, "set_margin_" + side)(14)
+        box.show_all()
+        return d
+
+    def code_dialog(self, role, peer_name, code):
+        p = Peer(peer_name)
+        self.show_window()
+        big = '<span font_family="monospace" size="%d" weight="bold">%s</span>' % (28 * 1024, esc(code))
+        if role == "asked":
+            parts = ['<span size="large" weight="bold">%s</span>' % esc("%s wants to link with this computer" % p.start),
+                     esc("Link only if %s shows the same code:" % p.mid),
+                     big,
+                     esc("Its keyboard, mouse and clipboard will then work with this computer.")]
+            buttons = [("Don't Link", Gtk.ResponseType.NO, None), ("Link", Gtk.ResponseType.YES, "suggested-action")]
+        else:
+            parts = ['<span size="large" weight="bold">%s</span>' % esc("Does %s show the code" % p.mid),
+                     big[:-len("</span>")] + "?</span>",
+                     esc("Check the code on %s, then confirm there too." % p.mid)]
+            buttons = [("Cancel", Gtk.ResponseType.NO, None), ("Yes, Link", Gtk.ResponseType.YES, "suggested-action")]
+        d = self.make_dialog(parts, buttons, Gtk.ResponseType.YES)
+        d.connect("response", self.code_answered)
+        d.present()
+        return d
+
+    def code_answered(self, d, resp):
+        if d is not self.dialog:
+            return
+        self.svc.send({"cmd": "answer", "yes": resp == Gtk.ResponseType.YES})
+        self.dialog = None   # dialog_key stays, so it is not shown again for the same code
+        d.destroy()
+
+    def ask_forget(self):
+        if not self.st or not self.st.get("linked"):
+            return
+        p = Peer(self.st.get("peer_name"))
+        d = self.make_dialog(['<span size="large" weight="bold">%s</span>' % esc("Forget %s?" % p.mid),
+                              esc("Its keyboard, mouse and clipboard stop working with this computer. "
+                                  "To use them together again, link the two computers again.")],
+                             [("Cancel", Gtk.ResponseType.CANCEL, None), ("Forget", Gtk.ResponseType.ACCEPT, "destructive-action")],
+                             Gtk.ResponseType.CANCEL)
+
+        def answered(dd, resp):
+            if resp == Gtk.ResponseType.ACCEPT:
+                self.svc.send({"cmd": "forget"})
+            if self.forget_dialog is dd:
+                self.forget_dialog = None
+            dd.destroy()
+        d.connect("response", answered)
+        self.forget_dialog = d
+        d.present()
+
+    # --- screenshot mode --------------------------------------------------------------------------
+    def take_screenshot(self):
+        if getattr(self, "_shot_done", False):
+            return False
+        self._shot_done = True
+        self.win.show_all() if not self.win.get_visible() else None
+        self._refresh()
+        GLib.timeout_add(300, self._save_shot)
+        return False
+
+    def _save_shot(self):
+        while Gtk.events_pending():
+            Gtk.main_iteration()
+        self.win.queue_draw()
+        while Gtk.events_pending():
+            Gtk.main_iteration()
+        pix = self.win.get_pixbuf()
+        if pix is None:
+            sys.stderr.write("could not draw the window\n")
+            Gtk.main_quit()
+            return False
+        pix.savev(self.screenshot, "png", [], [])
+        Gtk.main_quit()
+        return False
+
+
+class Tray:
+    """The top bar icon (an XEmbed tray icon) and its menu."""
+
+    def __init__(self, app):
+        self.app = app
+        self.size = 22
+        self.kind = None
+        self.icon = Gtk.StatusIcon()
+        self.icon.set_name("shenzhen-kvm")
+        self.icon.set_title(APP)
+        self.icon.connect("activate", lambda i: app.show_window())
+        self.icon.connect("popup-menu", self.popup)
+        self.icon.connect("size-changed", self.resized)
+        self.icon.connect("notify::embedded", lambda *a: self.watch_tray())
+        Gtk.Settings.get_default().connect("notify::gtk-theme-name", lambda *a: self.redraw())
+        Gtk.Settings.get_default().connect("notify::gtk-application-prefer-dark-theme", lambda *a: self.redraw())
+        self.menu = None
+        self.watched = None
+
+    def resized(self, icon, size):
+        if size > 0 and size != self.size:
+            self.size = size
+            self.redraw()
+        return True
+
+    def watch_tray(self):
+        """Redraws when the panel tells its tray icons a new colour."""
+        for w in Gtk.Window.list_toplevels():
+            if type(w).__name__ == "GtkTrayIcon" and w is not self.watched:
+                self.watched = w
+                try:
+                    w.connect("notify::fg-color", lambda *a: self.redraw())
+                except TypeError:
+                    pass
+        self.redraw()
+
+    def colour(self):
+        forced = os.environ.get("SHENZHEN_KVM_TRAY_GLYPH", "")
+        c = Gdk.RGBA()
+        if forced == "light":
+            c.parse("#f6f5f4")
+            return c
+        if forced == "dark":
+            c.parse("#2e3436")
+            return c
+        for w in Gtk.Window.list_toplevels():   # the colour the panel gives its tray icons, when it gives one
+            if type(w).__name__ == "GtkTrayIcon":
+                try:
+                    fg = w.get_property("fg-color")
+                except TypeError:
+                    fg = None
+                if fg is not None and (fg.red, fg.green, fg.blue) != (0.0, 0.0, 0.0):
+                    return fg
+        probe = Gtk.Window()        # else the theme's text colour, which panels follow
+        c = probe.get_style_context().get_color(Gtk.StateFlags.NORMAL)
+        probe.destroy()
+        return c
+
+    def redraw(self):
+        if self.kind:
+            k, self.kind = self.kind, None
+            self.set_kind(k)
+
+    def set_kind(self, kind):
+        if kind == self.kind:
+            return
+        self.kind = kind
+        self.icon.set_from_pixbuf(draw_glyph(kind, self.size, self.colour()))
+
+    def refresh(self):
+        st, app = self.app.st, self.app
+        if st is None:
+            kind = "warning"
+        else:
+            kind = {"driving": "filled", "driven": "badge"}.get(st.get("mode"), "outline")
+        self.set_kind(kind)
+        tip = short_status(st, app.svc.refused if hasattr(app, "svc") else None)
+        p = Peer((st or {}).get("peer_name"))
+        for t in (st or {}).get("transfers") or []:
+            if t.get("state") == "running" and (t.get("total") or 0) >= 1 << 20:
+                tip += "  %s%d%%" % ("↑" if t.get("dir") == "out" else "↓", int(fraction(t) * 100))
+                break
+        if self.icon.get_tooltip_text() != tip:
+            self.icon.set_tooltip_text(tip)
+        _ = p
+
+    def popup(self, icon, button, when):
+        app, st = self.app, self.app.st
+        m = Gtk.Menu()
+
+        def info(text):
+            i = Gtk.MenuItem(label=text)
+            i.set_sensitive(False)
+            m.append(i)
+        info(short_status(st, app.svc.refused))
+        p = Peer((st or {}).get("peer_name"))
+        pw = bool(st and st.get("paste_waiting"))
+        for t in ((st or {}).get("transfers") or [])[:3]:
+            state = t.get("state")
+            if state == "waiting":
+                w = "starting"
+            elif state == "running":
+                w = ("%d%% of %s" % (int(fraction(t) * 100), size_text(t.get("total")))) if t.get("total") else "sending"
+            else:
+                w = "done" if state == "done" else "failed"
+            extra = ", paste waiting" if pw and t.get("dir") == "in" and state in ("waiting", "running") else ""
+            info("%s: %s – %s%s" % (direction(t, p), t.get("what") or "", w, extra))
+        m.append(Gtk.SeparatorMenuItem())
+        sharing = Gtk.CheckMenuItem(label="Sharing")
+        sharing.set_active(bool(((st or {}).get("settings") or {}).get("sharing", True)))
+        sharing.set_sensitive(st is not None)
+        sharing.connect("toggled", lambda i: app.svc.send({"cmd": "settings", "sharing": i.get_active()}))
+        m.append(sharing)
+        if st and st.get("mode") == "driving":
+            b = Gtk.MenuItem(label="Bring the mouse back now")
+            b.connect("activate", lambda i: app.svc.send({"cmd": "bring_back"}))
+            m.append(b)
+        o = Gtk.MenuItem(label="Open Shenzhen KVM…")
+        o.connect("activate", lambda i: app.show_window())
+        m.append(o)
+        m.show_all()
+        self.menu = m   # keep it alive while it shows
+        m.popup(None, None, Gtk.StatusIcon.position_menu, icon, button, when)
+
+
+# ---------------------------------------------------------------------------------------------
+# One copy per desktop: a second start shows the first one's window
+# ---------------------------------------------------------------------------------------------
+def single_instance(sock_path, on_show):
+    tag = hashlib.sha1(("%s|%s|%s" % (os.getuid(), os.environ.get("DISPLAY", ""), sock_path)).encode()).hexdigest()[:16]
+    name = "\0shenzhen-kvm-tray-" + tag
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.bind(name)
+    except OSError:
+        s.close()
+        try:
+            c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            c.settimeout(2)
+            c.connect(name)
+            c.sendall(b"show\n")
+            c.close()
+        except OSError:
+            pass
+        return None
+    s.listen(4)
+
+    def accept(fd, cond):
+        try:
+            c, _ = s.accept()
+            c.settimeout(1)
+            if c.recv(64).startswith(b"show"):
+                on_show()
+            c.close()
+        except OSError:
+            pass
+        return True
+    GLib.io_add_watch(s.fileno(), GLib.PRIORITY_DEFAULT, GLib.IO_IN, accept)
+    return s
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="shenzhen-kvm-tray", description="Shenzhen KVM tray icon and window.")
+    run = os.environ.get("SHENZHEN_KVM_RUN") or "/run/shenzhen-kvm"
+    ap.add_argument("--socket", default=os.path.join(run, "control.sock"), help="the service's control socket")
+    ap.add_argument("--screenshot", metavar="OUT.png", help="draw the window once the service's state arrives, save it and exit")
+    args = ap.parse_args()
+
+    if not Gtk.init_check(sys.argv)[0]:
+        sys.stderr.write("shenzhen-kvm-tray: no desktop to show on (DISPLAY is not set or not reachable).\n")
+        return 1
+
+    holder = {}
+    if not args.screenshot:
+        lock = single_instance(args.socket, lambda: holder["app"].show_window())
+        if lock is None:
+            return 0
+        holder["lock"] = lock
+    app = App(args.socket, screenshot=args.screenshot)
+    holder["app"] = app
+
+    if args.screenshot:
+        def give_up():
+            if not getattr(app, "_shot_done", False):   # the service never answered: draw that
+                app.take_screenshot()
+            return False
+        GLib.timeout_add(3000, give_up)
+    else:
+        def first_look():
+            # the first time: show the window when there is no link yet, or when no tray shows the icon
+            if app.st is not None and not app.st.get("linked"):
+                app.show_window()
+            elif not app.tray.icon.is_embedded():
+                app.show_window()
+            return False
+        GLib.timeout_add(2500, first_look)
+
+    def quit_():
+        app.svc.close()
+        Gtk.main_quit()
+        return False
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, quit_)
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

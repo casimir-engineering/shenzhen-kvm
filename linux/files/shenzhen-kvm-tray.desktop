@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Shenzhen KVM
+GenericName=Shared keyboard and mouse
+Comment=Use one keyboard, mouse and clipboard with two computers
+Exec=/usr/local/bin/shenzhen-kvm-tray
+Icon=shenzhen-kvm
+Terminal=false
+Categories=Utility;Settings;
+Keywords=keyboard;mouse;clipboard;share;kvm;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true
