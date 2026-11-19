@@ -897,9 +897,12 @@ final class Core {
             return [0x02, 0x25]
         case 0x26:
             guard let j = try? JSONSerialization.jsonObject(with: Data(req.dropFirst())) as? [String: Any] else { return [0x02, 0x26] }
-            let adopted = locked { () -> Bool in let a = cfg.adopt(wire: j); if a { cfg.save() }; return a }
-            if adopted { log("settings from \(otherComputer()) adopted"); applySettings() }
-            else { DispatchQueue.global().async { self.sendSettings() } }   // ours are newer
+            let a = locked { () -> Config.Adoption in let a = cfg.adopt(wire: j); if a != .older { cfg.save() }; return a }
+            switch a {
+            case .changed: log("settings from \(otherComputer()) adopted"); applySettings()
+            case .same: break   // the same values: nothing to apply
+            case .older: DispatchQueue.global().async { self.sendSettings() }   // ours are newer
+            }
             return [0x02, 0x26]
         case 0x29:
             DispatchQueue.global().async { self.forget(tellPeer: false) }

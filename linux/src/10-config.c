@@ -51,10 +51,16 @@ static void parse_local_settings(const char *j) {
     if (json_str(j, "command_as", v, sizeof v)) st.command_super = !strcmp(v, "super");
 }
 static void load_settings(void) { char j[4096]; if (read_small(SETTINGS_FILE, j, sizeof j) > 0) parse_local_settings(j); }
-/* Settings from the peer: adopted when newer. Returns 1 when adopted. */
+/* The values of the settings (not when they changed), to tell a real change from a repeat. */
+static void settings_values(char *out, size_t n) {
+    snprintf(out, n, "%d%d%d%d%d%d%ld/%d/%d", st.sharing, st.peer_drives, st.drives_peer, st.clipboard, st.usual, st.big_files, st.limit_mb, cfg.edge, st.command_super);
+}
+/* Settings from the peer: 0 = ours are newer, 1 = newer and something changed, 2 = newer but the
+   same values (nothing to apply). */
 static int settings_from_peer(const char *j) {
-    long long ch = json_long(j, "changed", 0); char v[32];
+    long long ch = json_long(j, "changed", 0); char v[32], before[64], after[64];
     if (ch && ch <= st.changed) return 0;
+    settings_values(before, sizeof before);
     st.sharing = json_bool(j, "sharing", st.sharing); st.peer_drives = json_bool(j, "i_drive_you", st.peer_drives);
     st.drives_peer = json_bool(j, "you_drive_me", st.drives_peer); st.clipboard = json_bool(j, "clipboard", st.clipboard);
     st.usual = json_bool(j, "usual_shortcuts", st.usual); st.big_files = json_bool(j, "big_files", st.big_files);
@@ -62,18 +68,24 @@ static int settings_from_peer(const char *j) {
     if (json_str(j, "my_edge", v, sizeof v)) for (int i = 0; i < 4; i++) if (!strcmp(v, EDGE_NAMES[i])) { cfg.edge = i ^ 1; st.edge_set = 1; }
     if (json_str(j, "command_as", v, sizeof v)) st.command_super = !strcmp(v, "super");
     st.changed = ch ? ch : wall_ms();
-    return 1;
+    settings_values(after, sizeof after);
+    return strcmp(before, after) ? 1 : 2;
 }
-/* Settings changed here (tray app or command line): fields present in j are applied. */
-static void settings_from_local(const char *j) {
-    char v[32];
+/* Settings changed here (tray app or command line): fields present in j are applied. Returns 1 when a
+   value changed. */
+static int settings_from_local(const char *j) {
+    char v[32], before[64], after[64];
+    settings_values(before, sizeof before);
     st.sharing = json_bool(j, "sharing", st.sharing); st.peer_drives = json_bool(j, "peer_drives_me", st.peer_drives);
     st.drives_peer = json_bool(j, "i_drive_peer", st.drives_peer); st.clipboard = json_bool(j, "clipboard", st.clipboard);
     st.usual = json_bool(j, "usual_shortcuts", st.usual); st.big_files = json_bool(j, "big_files", st.big_files);
     long l = json_long(j, "file_limit_mb", st.limit_mb); if (l > 0) st.limit_mb = l;
     if (json_str(j, "edge", v, sizeof v)) for (int i = 0; i < 4; i++) if (!strcmp(v, EDGE_NAMES[i])) { cfg.edge = i; st.edge_set = 1; }
     if (json_str(j, "command_as", v, sizeof v)) st.command_super = !strcmp(v, "super");
+    settings_values(after, sizeof after);
+    if (!strcmp(before, after)) return 0;
     st.changed = wall_ms();
+    return 1;
 }
 
 /* ---------- HID usage <-> evdev (Linux hid-input.c table) ---------- */

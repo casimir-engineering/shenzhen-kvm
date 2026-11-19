@@ -136,7 +136,9 @@ static void handle_helper(void) {
     else if (t == 'N' && b.n) { snprintf(lk.peer_name, sizeof lk.peer_name, "%.*s", (int)b.n, b.p); tell_agent(0); }
     else if (t == 'G') {   /* settings from the peer */
         char j[4096]; size_t n = b.n < sizeof j - 1 ? b.n : sizeof j - 1; memcpy(j, b.p, n); j[n] = 0;
-        if (settings_from_peer(j)) { logmsg("settings from %s adopted", lk.peer_name); settings_applied(0); }
+        int r = settings_from_peer(j);
+        if (r == 1) { logmsg("settings from %s adopted", lk.peer_name); settings_applied(0); }
+        else if (r == 2) save_settings();   /* the same values: nothing to apply */
         else { buf_t w = {0}; settings_json(&w, 1); hsend(hsock, 'S', w.p, w.n); bfree(&w); }   /* ours are newer */
     }
     else if (t == 'F') { logmsg("%s forgot this link", lk.peer_name); forget_link(); }
@@ -168,7 +170,7 @@ static void handle_agent(void) {
     static buf_t b; uint8_t t;
     if (hrecv(asock, &t, &b)) { agent_lost(); return; }
     char j[4096]; size_t n = b.n < sizeof j - 1 ? b.n : sizeof j - 1; memcpy(j, b.p, n); j[n] = 0;
-    if (t == 'G') { settings_from_local(j); settings_applied(1); }
+    if (t == 'G') { if (settings_from_local(j)) settings_applied(1); }
     else if (t == 'F' && lk.ok) {   /* forget: tell the peer first (at most 3 s), then forget here */
         if (hsock >= 0 && peer_online()) { hsend(hsock, 'f', NULL, 0); forget_deadline = mono_ms() + 3000; } else forget_link();
     }
@@ -240,16 +242,43 @@ static void timers(void) {
 static volatile sig_atomic_t quit;
 static void on_sig(int s) { (void)s; quit = 1; }
 
-/* Restart when the link or this computer's config file changes. */
+/* What changed in the folders: 1 = the link (the service restarts, keeping its virtual devices),
+   2 = this computer's config.json (applied in place). */
 static int conf_changed(int fd) {
     char b[4096] __attribute__((aligned(8))); ssize_t n; int hit = 0;
     while ((n = read(fd, b, sizeof b)) > 0)
         for (char *p = b; p < b + n; ) {
             struct inotify_event *e = (void *)p;
-            if (e->len && (!strcmp(e->name, "link") || !strcmp(e->name, "config.json"))) hit = 1;
+            if (e->len && !strcmp(e->name, "link")) hit |= 1;
+            if (e->len && !strcmp(e->name, "config.json")) hit |= 2;
             p += sizeof *e + e->len;
         }
     return hit;
+}
+/* config.json changed: edge, speed, modifier keys and display, applied without a restart. */
+static void reload_config(void) {
+    char old_display[16]; snprintf(old_display, sizeof old_display, "%s", want_display);
+    want_display[0] = 0; load_config(); load_settings();
+    mod_keys(st.command_super ? "super" : "control", &cfg.cmd_l, &cfg.cmd_r); mod_keys(st.command_super ? "control" : "super", &cfg.ctl_l, &cfg.ctl_r);
+    edge_pushes = 0;
+    logmsg("config.json changed: edge %s, speed %.2f%s%s", EDGE_NAMES[cfg.edge], cfg.speed, strcmp(old_display, want_display) ? ", desktop " : "", strcmp(old_display, want_display) ? (want_display[0] ? want_display : "(the main one)") : "");
+    if (strcmp(old_display, want_display) && hsock >= 0) { kill(helper_pid, SIGTERM); helper_lost(); }   /* the helper reconnects to the chosen desktop */
+    tell_agent(0);
+}
+/* The virtual keyboard and pointer outlive restarts of the service (a link change): the compositor
+   never sees them go and come back. They are destroyed only when the service really stops. */
+static int valid_fd(int fd) { return fd >= 0 && fcntl(fd, F_GETFD) != -1; }
+static void adopt_or_create_devices(void) {
+    const char *keep = getenv("SHENZHEN_KVM_UINPUT"); int k = -1, p = -1;
+    if (keep && sscanf(keep, "%d,%d", &k, &p) == 2 && valid_fd(k) && valid_fd(p)) {
+        kfd = k; pfd = p; fcntl(kfd, F_SETFD, FD_CLOEXEC); fcntl(pfd, F_SETFD, FD_CLOEXEC);
+        logmsg("kept the virtual keyboard and pointer");
+    } else {
+        kfd = ui_create(0); pfd = ui_create(1);
+        if (kfd < 0 || pfd < 0) logmsg("cannot create virtual input devices: the keyboard and mouse can't be shared");
+        usleep(300000);   /* let the compositor pick up the virtual devices */
+    }
+    unsetenv("SHENZHEN_KVM_UINPUT");
 }
 
 static int run(void) {
@@ -264,6 +293,7 @@ static int run(void) {
     inotify_add_watch(ino_conf, CONF_DIR, IN_CLOSE_WRITE | IN_MOVED_TO | IN_DELETE | IN_MOVED_FROM);
     inotify_add_watch(ino_conf, STATE_DIR, IN_CLOSE_WRITE | IN_MOVED_TO | IN_DELETE | IN_MOVED_FROM);
     signal(SIGTERM, on_sig); signal(SIGINT, on_sig);
+    adopt_or_create_devices();
     if (linked) {
         shm->peer_dp = lk.peer_dp;
         udp = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
@@ -274,10 +304,7 @@ static int run(void) {
         int one = 1; setsockopt(udp, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
         if (bind(udp, (void *)&a, sizeof a)) { logmsg("cannot bind UDP %d: %s", PORT_UDP, strerror(errno)); return 1; }
         scan_ifaces(); dsock_open(&pres, PORT_UDP, udp); dsock_join(&pres);
-        kfd = ui_create(0); pfd = ui_create(1);
-        if (kfd < 0 || pfd < 0) logmsg("cannot create virtual input devices: the keyboard and mouse can't be shared");
         ino_dev = inotify_init1(IN_NONBLOCK | IN_CLOEXEC); inotify_add_watch(ino_dev, "/dev/input", IN_CREATE | IN_ATTRIB);
-        usleep(300000);   /* let the compositor pick up the virtual devices */
         dev_scan();
         helper_start();
         next_present_ms = mono_ms(); next_ifscan_ms = mono_ms() + 10000; missing_since_ms = mono_ms();
@@ -305,7 +332,7 @@ static int run(void) {
         if (q[0].revents & POLLIN) handle_udp();
         if (hsock >= 0 && q[1].revents) handle_helper();
         if (q[2].revents & POLLIN) { char b[4096]; while (read(ino_dev, b, sizeof b) > 0) ; dev_scan(); }
-        if (q[3].revents & POLLIN) restart = conf_changed(ino_conf);
+        if (q[3].revents & POLLIN) { int c = conf_changed(ino_conf); if (c & 1) restart = 1; else if (c & 2) reload_config(); }
         if (asock >= 0 && q[4].revents) handle_agent();
         if (q[5].revents & POLLIN) {   /* LED state from the compositor -> physical keyboards */
             struct input_event e[16]; ssize_t r = read(kfd, e, sizeof e);
@@ -326,7 +353,14 @@ static int run(void) {
     release_all();
     if (hsock >= 0) { close(hsock); kill(helper_pid, SIGTERM); waitpid(helper_pid, NULL, 0); }
     if (asock >= 0) { close(asock); kill(agent_pid, SIGTERM); waitpid(agent_pid, NULL, 0); }
-    if (kfd >= 0) ioctl(kfd, UI_DEV_DESTROY); if (pfd >= 0) ioctl(pfd, UI_DEV_DESTROY);
-    if (restart) { logmsg("link or settings changed: restarting"); execl("/proc/self/exe", "shenzhen-kvm", "run", (char *)NULL); }
+    if (restart && kfd >= 0 && pfd >= 0) {   /* the link changed: restart, handing the virtual devices over */
+        char keep[32]; snprintf(keep, sizeof keep, "%d,%d", kfd, pfd);
+        fcntl(kfd, F_SETFD, 0); fcntl(pfd, F_SETFD, 0); setenv("SHENZHEN_KVM_UINPUT", keep, 1);
+        logmsg("the link changed: restarting (keeping the virtual keyboard and pointer)");
+        execl("/proc/self/exe", "shenzhen-kvm", "run", (char *)NULL);
+        logmsg("cannot restart: %s", strerror(errno));
+    }
+    if (kfd >= 0) ioctl(kfd, UI_DEV_DESTROY); if (pfd >= 0) ioctl(pfd, UI_DEV_DESTROY);   /* a real stop */
+    if (restart) execl("/proc/self/exe", "shenzhen-kvm", "run", (char *)NULL);
     return 0;
 }

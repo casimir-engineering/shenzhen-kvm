@@ -147,10 +147,14 @@ struct Config {
         return Array(try! JSONSerialization.data(withJSONObject: j, options: [.sortedKeys]))
     }
 
-    /// SETTINGS from the peer: adopted when newer. Returns true when adopted.
-    mutating func adopt(wire j: [String: Any]) -> Bool {
+    /// The shared values (not when they changed), to tell a real change from a repeat.
+    var sharedValues: String { "\(paused)\(macDrivesPeer)\(peerDrivesMac)\(clipboard)\(usualShortcuts)\(bigFiles)\(fileLimitMB)\(edge)\(commandSuper)" }
+    enum Adoption { case older, changed, same }
+    /// SETTINGS from the peer: adopted when newer.
+    mutating func adopt(wire j: [String: Any]) -> Adoption {
         let ch = (j["changed"] as? Int64) ?? Int64(j["changed"] as? Int ?? 0)
-        if ch != 0 && ch <= changed { return false }
+        if ch != 0 && ch <= changed { return .older }
+        let before = sharedValues
         if let v = j["sharing"] as? Bool { paused = !v }
         if let v = j["i_drive_you"] as? Bool { peerDrivesMac = v }
         if let v = j["you_drive_me"] as? Bool { macDrivesPeer = v }
@@ -161,7 +165,7 @@ struct Config {
         if let v = j["my_edge"] as? String, let e = Edge(rawValue: v) { edge = e.opposite }
         if let v = j["command_as"] as? String { commandSuper = v == "super" }
         changed = ch != 0 ? ch : Int64(Date().timeIntervalSince1970 * 1000)
-        return true
+        return sharedValues == before ? .same : .changed
     }
 }
 

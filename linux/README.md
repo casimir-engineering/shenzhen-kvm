@@ -80,7 +80,10 @@ They work for root and for the person who owns the desktop (the user running the
   queries, the clipboard) and the TCP clipboard channel; **agent** serves the control socket
   (`/run/shenzhen-kvm/control.sock`, newline-delimited JSON, used by the top-bar app and the command
   line), finds computers and links them.
-- Input is injected through two uinput devices, `Shenzhen KVM keyboard` and `Shenzhen KVM pointer`.
+- Input is injected through two uinput devices, `Shenzhen KVM keyboard` and `Shenzhen KVM pointer`,
+  created once when the service starts and destroyed only when it stops: a settings or `config.json`
+  change is applied in place, and a link change restarts the service with the devices handed over, so
+  the desktop never sees them go and come back.
   The pointer device is absolute (0..65535): the service keeps the pointer position itself and applies
   the other computer's movements 1:1 times `speed`. Keyboards plugged in here are held by the service
   (EVIOCGRAB) and replayed through its keyboard, so shortcuts can be caught and go to the other
