@@ -309,7 +309,7 @@ static int run(void) {
         if ((state == DRIVEN || state == IDLE) && pos_dirty && !query_out && hsock >= 0) query(2);
         timers();
     }
-    if (state == DRIVING) { send_leave(0); stop_driving("service stopping", 0, 0); }
+    if (state == DRIVING) stop_driving("service stopping", 0, 0);   /* no LEAVE: the other computer keeps the pointer */
     release_all();
     if (hsock >= 0) { close(hsock); kill(helper_pid, SIGTERM); waitpid(helper_pid, NULL, 0); }
     if (asock >= 0) { close(asock); kill(agent_pid, SIGTERM); waitpid(agent_pid, NULL, 0); }

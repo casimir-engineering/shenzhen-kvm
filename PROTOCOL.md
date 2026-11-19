@@ -154,6 +154,8 @@ Plaintext = one or more events back to back. All integers big-endian.
 
 Rules:
 - Replies (ACK) go to the source address and port of the packet being answered.
+- A computer that stops (quits, restarts) while it is the remote sends nothing: the other computer
+  keeps the pointer. One that stops while it holds the pointer leaves it to the remote's watchdog.
 - **Watchdogs.** The holder releases every key and button it injected after 2 s without any packet
   from the remote (it stays the holder). The remote takes the pointer back after 2 s without any
   packet from the holder: it becomes the holder with its pointer where it was parked.
