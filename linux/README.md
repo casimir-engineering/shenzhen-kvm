@@ -18,7 +18,10 @@ Both follow `../PROTOCOL.md`.
   and the clipboard then holds them (paste them in a file manager or an upload dialog). A paste pressed
   before they have all arrived waits for them. When the usual shortcuts are switched off,
   **Ctrl+Shift+C** copies here and sends, **Ctrl+Shift+V** pastes what the other computer copied.
-- **Top-bar app** (`shenzhen-kvm-tray`): a keyboard icon in the top bar. Its menu says where the mouse
+- **Top-bar app** (`shenzhen-kvm-tray`): the app's own icon in the top bar (the same as on the Mac):
+  in full colour while sharing works, dimmed when the computers aren't linked or sharing is off, grey
+  when the service isn't running, with a small green dot while one computer's keyboard and mouse are
+  in use on the other. Its menu says where the mouse
   is and lists transfers; **Open Shenzhen KVM…** opens the window: sharing on/off, linking (make this
   computer visible, the computers that are visible, the code to compare, forgetting the link), which
   side the other computer's screen is on, the clipboard settings and the transfers with their progress.

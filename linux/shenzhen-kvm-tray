@@ -382,6 +382,48 @@ def app_icons():
     return None, out
 
 
+def tray_icon(kind, size):
+    """The app's own coloured icon for the top bar: full when sharing works, dimmed when not linked or
+    sharing is off, grey when the service isn't running, with a small green dot while one computer's
+    keyboard and mouse are in use on the other."""
+    size = max(12, int(size))
+    name, pixbufs = app_icons()
+    src = None
+    if name:
+        try:
+            src = Gtk.IconTheme.get_default().load_icon(name, size, Gtk.IconLookupFlags.FORCE_SIZE)
+        except GLib.Error:
+            src = None
+    if src is None and pixbufs:
+        bigger = [p for p in pixbufs if p.get_width() >= size]
+        src = min(bigger, key=lambda p: p.get_width()) if bigger else pixbufs[-1]
+    if src is None:   # no icon files at all: the drawn glyph
+        return draw_glyph({"dim": "outline"}.get(kind, kind), size, Gdk.RGBA(0.3, 0.3, 0.3, 1))
+    icon = src.scale_simple(size, size, GdkPixbuf.InterpType.HYPER) if src.get_width() != size else src.copy()
+    if kind in ("dim", "warning"):
+        grey = icon.copy()
+        icon.saturate_and_pixelate(grey, 0.0 if kind == "warning" else 0.35, False)
+        out = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, True, 8, size, size)
+        out.fill(0x00000000)
+        grey.composite(out, 0, 0, size, size, 0, 0, 1, 1, GdkPixbuf.InterpType.NEAREST, 110 if kind == "warning" else 150)
+        return out
+    if kind in ("filled", "badge"):
+        d = max(5, size * 2 // 5)
+        r = d / 2.0
+        data = bytearray(d * d * 4)
+        for y in range(d):
+            for x in range(d):
+                dist = ((x + 0.5 - r) ** 2 + (y + 0.5 - r) ** 2) ** 0.5
+                i = (y * d + x) * 4
+                if dist <= r - 1.2:      # green inside a white ring
+                    data[i:i + 4] = bytes((52, 199, 89, 255))
+                elif dist <= r:
+                    data[i:i + 4] = bytes((255, 255, 255, 255))
+        dot = GdkPixbuf.Pixbuf.new_from_bytes(GLib.Bytes.new(bytes(data)), GdkPixbuf.Colorspace.RGB, True, 8, d, d, d * 4)
+        dot.composite(icon, size - d, size - d, d, d, size - d, size - d, 1, 1, GdkPixbuf.InterpType.NEAREST, 255)
+    return icon
+
+
 # ---------------------------------------------------------------------------------------------
 # The app
 # ---------------------------------------------------------------------------------------------
@@ -996,14 +1038,22 @@ class Tray:
         if kind == self.kind:
             return
         self.kind = kind
-        self.icon.set_from_pixbuf(draw_glyph(kind, self.size, self.colour()))
+        try:
+            scale = Gdk.Display.get_default().get_monitor(0).get_scale_factor()
+        except Exception:
+            scale = 1
+        self.icon.set_from_pixbuf(tray_icon(kind, self.size * max(1, scale)))
 
     def refresh(self):
         st, app = self.app.st, self.app
         if st is None:
             kind = "warning"
         else:
-            kind = {"driving": "filled", "driven": "badge"}.get(st.get("mode"), "outline")
+            sharing = (st.get("settings") or {}).get("sharing", True)
+            if not st.get("linked") or not sharing:
+                kind = "dim"
+            else:
+                kind = {"driving": "filled", "driven": "badge"}.get(st.get("mode"), "outline")
         self.set_kind(kind)
         tip = short_status(st, app.svc.refused if hasattr(app, "svc") else None)
         p = Peer((st or {}).get("peer_name"))
