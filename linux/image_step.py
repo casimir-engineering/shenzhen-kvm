@@ -63,6 +63,9 @@ def install(r):
         work.rmdir()
     for rel, (src, mode) in FILES.items():
         r.put(rel, HERE / src, FEATURE, mode)
+    # GTK finds a theme's icons through its cache: without a fresh one the tray shows a fallback glyph.
+    if r.path('usr/bin/gtk-update-icon-cache').exists():
+        subprocess.run(['chroot', str(r.p), 'gtk-update-icon-cache', '-q', '-f', '/usr/share/icons/hicolor'], check=True)
     for p in PRIVATE:
         _need(not r.path(p).exists(), 'the image must not contain ' + p)
     r.enable(UNIT, feature=FEATURE)
