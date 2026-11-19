@@ -48,6 +48,8 @@ final class Core {
     private var parkedAt = CGPoint.zero           // where this Mac's pointer was hidden
     private var heldSince = -10.0                 // when an ENTER made this Mac the holder
     private var localMoved = false                // this Mac's own mouse moved since the last remote move
+    private var claim = false                     // holds the pointer with a claim (PROTOCOL.md Restarts)
+    private var graceUntil = 0.0                  // the holder restarts: wait for it until then
     private var lastPostAt = 0.0
     private var leavePending: (pos: UInt16, since: Double, last: Double)?
     private var swallowUp: Set<UInt16> = []
@@ -82,6 +84,10 @@ final class Core {
         refreshDisplays()
         box = Box(link: link)
         if let l = link { setOtherName(l.peerName); peerDP = l.peerDP }
+        // Stopped with the pointer here less than 60 s ago: it stays here.
+        let held = UserDefaults.standard.double(forKey: "heldPointerAt")
+        if held > 0 && Date().timeIntervalSince1970 - held < 60 { claim = true; log("the pointer stays on this Mac (it was here before the restart)") }
+        UserDefaults.standard.removeObject(forKey: "heldPointerAt")
         udp = UDP(port: portBase)
         if udp == nil { log("cannot bind UDP \(portBase)") }
         finder.core = self
@@ -412,7 +418,7 @@ final class Core {
     private func startDriving() {
         let here = currentPointer()
         locked {
-            mode = .driving; lastPeer = mono(); lastAlive = 0; push = 0; parkedAt = here
+            mode = .driving; lastPeer = mono(); lastAlive = 0; push = 0; parkedAt = here; claim = false; graceUntil = 0
             sendLat.removeAll(); rtt.removeAll()
         }
         if !inputDisabled { CGAssociateMouseAndMouseCursorPosition(0) }
@@ -435,7 +441,7 @@ final class Core {
     func stopDriving(sendLeave: Bool, pos: UInt16?, why: String, entry: Edge? = nil) {
         let (was, target) = locked { () -> (Mode, CGPoint) in
             let w = mode
-            if w == .driving { mode = .idle; push = 0 }
+            if w == .driving { mode = .idle; push = 0; claim = true }
             if sendLeave && w == .driving { let now = mono(); leavePending = (0, now, now) }
             let t = pos.map { pointAt(entry ?? cfg.edge, $0, inset: 1) } ?? clamp(parkedAt)
             if w == .driving { vpos = t }
@@ -470,7 +476,7 @@ final class Core {
                 if now - enterSince > 1.0 { mode = .idle; enterFailAt = now; push = 0 }
                 else if now - enterLast >= 0.2 { enterLast = now; doEnter = true }
             case .driving:
-                if now - lastPeer > 2.0 { timeout = true }
+                if now - lastPeer > 2.0 && now >= graceUntil { timeout = true }
                 else if now - lastAlive >= 0.5 { lastAlive = now; aliveSentAt = now; doAlive = true }
             case .driven:
                 if now - lastPeer > 2.0 { drivenTimeout = true }
@@ -500,7 +506,7 @@ final class Core {
                 finder.handlePresent(pkt, ss); continue
             }
             guard let box = locked({ box }), let plain = box.open(pkt, replayCheck: true) else { continue }
-            locked { lastPeer = mono() }
+            locked { lastPeer = mono(); if graceUntil > 0 && plain.first != 0x04 { graceUntil = 0 } }
             heard(ip: ipString(from.sin_addr), by: nil)
             var r = Reader(plain)
             while let t = r.u8() {
@@ -526,6 +532,9 @@ final class Core {
                 case 0x13:
                     guard let u = r.u16(), let d = r.u8() else { break }
                     if holding() { drivenKey(u, d != 0) }
+                case 0x04:   // STOPPING: the holder restarts; wait for it
+                    ack(0x04, from)
+                    if locked({ mode == .driving }) { locked { graceUntil = mono() + 30 }; log("\(otherComputer()) is restarting; waiting for it") }
                 case 0x1F:
                     ack(0x1F, from)
                 default:
@@ -533,6 +542,23 @@ final class Core {
                 }
             }
         }
+    }
+
+    /// PRESENT's "holds": this Mac holds the pointer with a claim.
+    var holdsWithClaim: Bool { locked { claim && mode != .driving && link != nil } }
+    /// The peer holds the pointer with a claim and this Mac has none (it just started): rejoin as the remote.
+    func peerHolds() {
+        guard locked({ !claim && mode == .idle && !cfg.paused && cfg.macDrivesPeer }) else { return }
+        log("\(otherComputer()) has the pointer; this Mac rejoins without it")
+        startDriving()
+    }
+    /// Quitting or restarting: with the pointer here (claim), keep it here across the restart.
+    func prepareStop() {
+        if holdsWithClaim {
+            UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "heldPointerAt"); UserDefaults.standard.synchronize()
+            send([0x04]); usleep(20_000); send([0x04])
+            log("stopping with the pointer here: \(otherComputer()) waits for this Mac")
+        } else { UserDefaults.standard.removeObject(forKey: "heldPointerAt") }
     }
 
     /// This Mac holds the pointer and may apply the other computer's input: switches idle to driven,
@@ -583,7 +609,7 @@ final class Core {
         if (m == .driven || m == .idle) && mono() - locked({ heldSince }) < 1.5 { return }   // a repeat of the ENTER that gave it
         if m == .driving { stopDriving(sendLeave: false, pos: pos, why: "the pointer came back", entry: e) }
         let p = locked { () -> CGPoint in
-            mode = .driven; drivenEdge = e; lastPeer = mono(); push = 0; heldSince = mono()
+            mode = .driven; drivenEdge = e; lastPeer = mono(); push = 0; heldSince = mono(); claim = true
             buttons = []; keysDown = []; rawDown = []; switcher = nil; flags = 0; scrollAcc = (0, 0)
             vpos = pointAt(e, pos, inset: 1)
             return vpos

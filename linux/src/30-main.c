@@ -170,11 +170,12 @@ static void end_driven(const char *why) {
     release_all(); state = IDLE; logmsg("session ended: %s", why);
 }
 static double park_x, park_y;          /* where this computer's pointer was hidden */
-static int64_t held_since_ms = -10000, leave_until_ms, next_leave_ms;
+static int64_t held_since_ms = -10000, leave_until_ms, next_leave_ms, stopping_grace_until;
+static int claim;                      /* holds the pointer with a claim (PROTOCOL.md Restarts) */
 /* The pointer goes to the peer (this computer becomes the remote): hide it here, hold the mice,
    forward all input. */
 static void start_driving(void) {
-    release_all();
+    release_all(); claim = 0; stopping_grace_until = 0;
     park_x = px; park_y = py;
     grab_mice(1);
     state = DRIVING; last_rx_ms = mono_ms(); next_alive_ms = last_rx_ms + 500;
@@ -291,6 +292,7 @@ static void handle_udp(void) {
         uint64_t ctr; long ml = unseal(in, n, m, &ctr);
         if (ml < 1 || ctr <= rx_high) continue;
         rx_high = ctr; last_rx_ms = mono_ms(); last_peer_seen_ms = last_rx_ms; last_src = src;
+        if (stopping_grace_until && m[0] != 0x04) stopping_grace_until = 0;   /* the holder is back */
         peer_heard(src.sin_addr.s_addr, NULL);
         if (state == DRIVEN && m[0] == 0x10) net_record(ctr);
         int moved = 0, keyed = 0;
@@ -303,7 +305,7 @@ static void handle_udp(void) {
                 send_ack(0x01, &src);
                 if ((state == DRIVEN || state == IDLE) && mono_ms() - held_since_ms < 1500) continue;   /* a repeat of the ENTER that gave it */
                 if (state == DRIVING) stop_driving("it came back", 1, pos);
-                release_all(); state = DRIVEN; entry_edge = edge; wheel_acc_x = wheel_acc_y = 0; held_since_ms = mono_ms();
+                release_all(); state = DRIVEN; entry_edge = edge; wheel_acc_x = wheel_acc_y = 0; held_since_ms = mono_ms(); claim = 1;
                 double x, y; edge_point(edge, pos, 0, &x, &y); place_pointer(x, y);
                 logmsg("the pointer is here (from %s, in through the %s edge)", lk.peer_name, EDGE_NAMES[edge]);
             } else if (t == 0x02 && i + 2 <= ml) {   /* ACK */
@@ -349,6 +351,10 @@ static void handle_udp(void) {
                 unsigned u = get16(m + i + 1); int d = m[i + 3] ? 1 : 0; i += 4;
                 if (state != DRIVEN) continue;
                 keyed |= driven_key(u, d);
+            } else if (t == 0x04) {                  /* STOPPING: the holder restarts; wait for it */
+                i += 1; send_ack(0x04, &src);
+                if (state == DRIVING) { stopping_grace_until = mono_ms() + 30000; logmsg("%s is restarting; waiting for it", lk.peer_name); }
+                continue;
             } else if (t == 0x1F) {                  /* ALIVE */
                 i += 1; send_ack(0x1F, &src);
             } else break;
@@ -427,7 +433,7 @@ static void handle_dev(struct dev *d) {
             if (state == DRIVING) {
                 if (phys_down[KEY_LEFTSHIFT] && phys_down[KEY_RIGHTSHIFT]) {   /* take the pointer back */
                     send_leave(0); leave_until_ms = mono_ms() + 1500; next_leave_ms = mono_ms() + 200;
-                    stop_driving("both Shift keys", 0, 0);
+                    stop_driving("both Shift keys", 0, 0); claim = 1;
                     continue;
                 }
                 if (c < 256 && key_to_usage[c]) send_key_mac(key_to_usage[c], v);

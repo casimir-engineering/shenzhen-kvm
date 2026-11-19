@@ -347,7 +347,7 @@ final class Finder {
     func startPresence(udp4: Int32) { locked { if pres == nil { pres = DSock(port: portBase, existing4: udp4); pres!.join(ifs); nextPresent = 0 } } }
     func makePresent(_ m: Methods, reply: Bool) -> [UInt8]? {
         guard let core, let box = core.box, let link = core.link else { return nil }
-        let j: [String: Any] = ["id": myIDHex, "dp": Int(portBase), "addrs": myAddrs(ifs), "reply": reply, "via": m.name]
+        let j: [String: Any] = ["id": myIDHex, "dp": Int(portBase), "addrs": myAddrs(ifs), "reply": reply, "via": m.name, "holds": core.holdsWithClaim]
         return MAGIC + [0x03] + link.linkID + box.seal(Array(try! JSONSerialization.data(withJSONObject: j)))
     }
     func sendPresent(reply: Bool) {
@@ -366,6 +366,7 @@ final class Finder {
         let missing = !core.peerFound
         if let dp = j["dp"] as? Int, dp > 0, dp < 65536 { core.locked { core.peerDP = UInt16(dp) } }
         if let ip = pickAddress(j, src, ifs) { core.heard(ip: ip, by: j["via"] as? String ?? "direct") }
+        if j["holds"] as? Bool == true { core.peerHolds() }
         if j["reply"] as? Bool == true || missing { sendPresent(reply: false) }
     }
 

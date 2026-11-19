@@ -88,6 +88,7 @@ signal(SIGTERM, SIG_IGN)
 let termSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .global())
 termSource.setEventHandler {
     if let core = delegate.core {
+        core.prepareStop()
         core.stopDriving(sendLeave: false, pos: nil, why: "app stopped")   // the other computer keeps the pointer
         core.endDriven(why: "app stopped")
         core.awdl.restoreNow()

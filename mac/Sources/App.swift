@@ -403,6 +403,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard let core else { return .terminateNow }
+        core.prepareStop()
         core.stopDriving(sendLeave: false, pos: nil, why: "quit")   // the other computer keeps the pointer
         core.endDriven(why: "quit")
         core.awdl.restoreNow()

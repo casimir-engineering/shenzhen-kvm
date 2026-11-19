@@ -54,7 +54,7 @@
 static char CONF_DIR[256] = "/etc/shenzhen-kvm";            /* config.json: edge, speed, modifier keys */
 static char STATE_DIR[256] = "/var/lib/shenzhen-kvm";       /* id, link, settings.json */
 static char RUN_DIR[256] = "/run/shenzhen-kvm";             /* control.sock */
-static char CONF_FILE[300], ID_FILE[300], LINK_FILE[300], SETTINGS_FILE[300], CONTROL_SOCK[300];
+static char CONF_FILE[300], ID_FILE[300], LINK_FILE[300], SETTINGS_FILE[300], CONTROL_SOCK[300], HELD_FILE[300];
 static int PORT_UDP = 24800, PORT_TCP = 24801, PORT_DISC = 24802;
 #define MAX_CLIP (2000u << 20)
 #define MDNS_TYPE "_shenzhen-kvm._udp"
@@ -72,6 +72,7 @@ static void init_paths(void) {
     snprintf(LINK_FILE, sizeof LINK_FILE, "%s/link", STATE_DIR);
     snprintf(SETTINGS_FILE, sizeof SETTINGS_FILE, "%s/settings.json", STATE_DIR);
     snprintf(CONTROL_SOCK, sizeof CONTROL_SOCK, "%s/control.sock", RUN_DIR);
+    snprintf(HELD_FILE, sizeof HELD_FILE, "%s/held", STATE_DIR);
     if ((e = getenv("SHENZHEN_KVM_PORT_BASE")) && atoi(e) > 0 && atoi(e) < 65530) { PORT_UDP = atoi(e); PORT_TCP = PORT_UDP + 1; PORT_DISC = PORT_UDP + 2; }
 }
 

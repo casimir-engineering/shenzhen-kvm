@@ -34,7 +34,7 @@ FILES = {
 FILES.update({f'usr/share/icons/hicolor/{s}x{s}/apps/shenzhen-kvm.png': (f'files/icons/shenzhen-kvm-{s}.png', 0o644)
               for s in (16, 24, 32, 48, 64, 128, 256)})
 # Must never be in an image: they belong to one computer.
-PRIVATE = ('var/lib/shenzhen-kvm/link', 'var/lib/shenzhen-kvm/id', 'var/lib/shenzhen-kvm/settings.json')
+PRIVATE = ('var/lib/shenzhen-kvm/link', 'var/lib/shenzhen-kvm/id', 'var/lib/shenzhen-kvm/settings.json', 'var/lib/shenzhen-kvm/held')
 
 
 def _need(ok, msg):

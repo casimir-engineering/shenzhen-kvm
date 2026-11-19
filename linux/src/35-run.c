@@ -8,7 +8,8 @@ static void make_present(buf_t *b, int method, void *arg) {
     int reply = *(int *)arg;
     buf_t j = {0};
     bprintf(&j, "{\"id\": \"%s\", \"dp\": %d, ", my_id_hex, PORT_UDP); put_addrs(&j);
-    bprintf(&j, ", \"reply\": %s, \"via\": \"%s\"}", reply ? "true" : "false", method_name(method));
+    bprintf(&j, ", \"reply\": %s, \"via\": \"%s\", \"holds\": %s}", reply ? "true" : "false", method_name(method),
+            claim && (state == IDLE || state == DRIVEN || state == ENTERING) ? "true" : "false");
     uint8_t out[1600]; size_t c = j.n < 1400 ? seal(j.p, j.n, out) : 0; bfree(&j);
     uint8_t t = 0x03; b->n = 0; bput(b, MAGIC, 6); bput(b, &t, 1); bput(b, lk.link_id, 8); bput(b, out, c);
 }
@@ -31,6 +32,10 @@ static void handle_present(const uint8_t *in, size_t n, struct sockaddr_storage 
     int dp = (int)json_long((char *)m, "dp", 0); if (dp > 0 && dp < 65536) shm->peer_dp = dp;
     int missing = !peer_online();
     peer_heard(pick_addr((char *)m, src), via);
+    /* the peer holds the pointer with a claim and this computer has none (it just started): rejoin as the remote */
+    if (json_bool((char *)m, "holds", 0) && !claim && state == IDLE && st.sharing && st.drives_peer) {
+        logmsg("%s has the pointer: this computer's pointer is hidden", lk.peer_name); start_driving();
+    }
     if (json_bool((char *)m, "reply", 0) || missing) send_present(0, 0);
 }
 static void handle_present6(void) {
@@ -179,7 +184,7 @@ static int64_t next_deadline(void) {
     if (state == ENTERING) { d = next_retx_ms < deadline_ms ? next_retx_ms : deadline_ms; }
     if (leave_until_ms && next_leave_ms < d) d = next_leave_ms;
     if (state == DRIVEN) d = last_rx_ms + 2000;
-    if (state == DRIVING) { d = next_alive_ms < last_rx_ms + 2000 ? next_alive_ms : last_rx_ms + 2000; }
+    if (state == DRIVING) { int64_t w = last_rx_ms + 2000 > stopping_grace_until ? last_rx_ms + 2000 : stopping_grace_until; d = next_alive_ms < w ? next_alive_ms : w; }
     if (hsock < 0 && linked && helper_restart_at < d) d = helper_restart_at;
     if (asock < 0 && agent_restart_at < d) d = agent_restart_at;
     if (paste_wait && paste_wait_until < d) d = paste_wait_until;
@@ -208,7 +213,7 @@ static void timers(void) {
     } else if (state == DRIVEN) {
         if (now - last_rx_ms >= 2000) { end_driven("no packet for 2 s"); set_error("%s went silent while its keyboard was in use here; keys released", lk.peer_name); }
     } else if (state == DRIVING) {
-        if (now - last_rx_ms >= 2000) { stop_driving("no answer for 2 s", 0, 0); set_error("%s stopped answering; the pointer is back here", lk.peer_name); }
+        if (now - last_rx_ms >= 2000 && now >= stopping_grace_until) { stop_driving("no answer", 0, 0); claim = 1; set_error("%s stopped answering; the pointer is back here", lk.peer_name); }
         else if (now >= next_alive_ms) { uint8_t m = 0x1F; udp_send(&m, 1); next_alive_ms = now + 500; }
     }
     if (!linked) return;
@@ -276,6 +281,9 @@ static int run(void) {
         dev_scan();
         helper_start();
         next_present_ms = mono_ms(); next_ifscan_ms = mono_ms() + 10000; missing_since_ms = mono_ms();
+        char hb[32];   /* stopped with the pointer here less than 60 s ago: start with the claim */
+        if (read_small(HELD_FILE, hb, sizeof hb) > 0 && (long long)(now_us() / 1000000) - atoll(hb) < 60) { claim = 1; logmsg("the pointer stays here (it was here before the restart)"); }
+        unlink(HELD_FILE);
         logmsg("running: linked with %s, edge %s, speed %.2f, ports %d-%d", lk.peer_name, EDGE_NAMES[cfg.edge], cfg.speed, PORT_UDP, PORT_DISC);
     } else logmsg("not linked yet: waiting for a link (shenzhen-kvm visible, shenzhen-kvm link, or the tray app)");
     agent_start(); tell_agent(1);
@@ -310,6 +318,11 @@ static int run(void) {
         timers();
     }
     if (state == DRIVING) stop_driving("service stopping", 0, 0);   /* no LEAVE: the other computer keeps the pointer */
+    else if (linked && claim && (state == IDLE || state == DRIVEN || state == ENTERING)) {   /* keep the pointer here across the restart */
+        char t[32]; int n = snprintf(t, sizeof t, "%lld\n", (long long)(now_us() / 1000000)); write_file_atomic(HELD_FILE, t, n, 0600);
+        uint8_t m = 0x04; udp_send(&m, 1); usleep(20000); udp_send(&m, 1);
+        logmsg("stopping with the pointer here: %s waits for this computer", lk.peer_name);
+    }
     release_all();
     if (hsock >= 0) { close(hsock); kill(helper_pid, SIGTERM); waitpid(helper_pid, NULL, 0); }
     if (asock >= 0) { close(asock); kill(agent_pid, SIGTERM); waitpid(agent_pid, NULL, 0); }

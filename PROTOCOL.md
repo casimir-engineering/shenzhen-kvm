@@ -71,7 +71,7 @@ Datagrams: `"SZKVM1"` (6 bytes), u8 type, then the body.
 |------|------|------|------|
 | 0x01 | LOOKING | UTF-8 JSON `{"id", "name", "dp", "addrs", "via", "v": 1}` | to port 24802 by a looking computer, every 2 s by each method (the sweep every 30 s); visible computers answer each one with VISIBLE, unicast to the packet's source address and port, with the same `via` |
 | 0x02 | VISIBLE | UTF-8 JSON `{"id", "name", "dp", "addrs", "left": seconds of visibility left, "via", "v": 1}` | answer to LOOKING; also every 2 s by each method while visible (the sweep every 30 s) |
-| 0x03 | PRESENT | u8[8] link id, then a sealed packet (above) whose plaintext is JSON `{"id", "dp", "addrs", "reply": true/false, "via"}` | to the linked computer's input port (24800) by a linked computer: every 5 s while its peer is missing (and a sweep every 2 minutes once it has been missing for 30 s), every 30 s once found, at start and when the network changes; also unicast to its last address. The peer answers a PRESENT whose `reply` is true, or any PRESENT while it considers the sender missing, with its own (`reply` false), unicast to the source |
+| 0x03 | PRESENT | u8[8] link id, then a sealed packet (above) whose plaintext is JSON `{"id", "dp", "addrs", "reply": true/false, "via", "holds": true/false}` (`holds`: the sender holds the pointer and got it from the other computer or took it back, see One pointer) | to the linked computer's input port (24800) by a linked computer: every 5 s while its peer is missing (and a sweep every 2 minutes once it has been missing for 30 s), every 30 s once found, at start and when the network changes; also unicast to its last address. The peer answers a PRESENT whose `reply` is true, or any PRESENT while it considers the sender missing, with its own (`reply` false), unicast to the source |
 
 `dp` is the sender's input port (UDP); its clipboard port is `dp + 1` and its linking port `dp + 2`.
 `addrs` lists the sender's IPv4 addresses on the interfaces above. `via` names the method that carried
@@ -150,12 +150,21 @@ Plaintext = one or more events back to back. All integers big-endian.
 | 0x11 | BUTTON | u8 button (1 left, 2 right, 3 middle, 4 back, 5 forward), u8 down (1/0) | remote |
 | 0x12 | SCROLL | i16 dx, i16 dy in 1/120 notch units (positive dy = the view scrolls down towards the end of the page, as a wheel turned towards the user: Linux REL_WHEEL -1 = dy +120; positive dx = the view scrolls right) | remote |
 | 0x13 | KEY    | u16 USB HID keyboard usage (page 0x07, e.g. 0x04 = A, 0xE0..0xE7 modifiers), u8 down (1/0). One down per press: the remote never sends auto-repeat downs; the holder generates key repeat itself while a key is held | remote |
+| 0x04 | STOPPING | none | the holder, when it stops with a claim (see Restarts); the remote answers ACK(0x04) and waits up to 30 s instead of 2 s before taking the pointer back |
 | 0x1F | ALIVE  | none | the remote, every 500 ms; the holder answers each ALIVE with ACK(0x1F) |
 
 Rules:
 - Replies (ACK) go to the source address and port of the packet being answered.
-- A computer that stops (quits, restarts) while it is the remote sends nothing: the other computer
-  keeps the pointer. One that stops while it holds the pointer leaves it to the remote's watchdog.
+- **Restarts keep the pointer where it is.** A computer "holds with a claim" from the moment it gets
+  the pointer from the other computer (ENTER) or takes
+  it back (both Shift keys, the menu, its watchdog), until it hands it over. Its PRESENT messages say
+  `holds: true` then. A computer that starts (or restarts) without a claim and hears `holds: true`
+  from its peer becomes the remote at once (its pointer hidden, its input forwarded).
+  A computer that stops (quits, restarts, updates) while it is the remote sends nothing: the other
+  keeps the pointer. One that stops while it holds the pointer with a claim sends STOPPING and keeps
+  its claim for 60 s (Mac: in its preferences; Linux: `/var/lib/shenzhen-kvm/held`); the remote then
+  waits up to 30 s for it instead of 2 s, and a restart within 60 s starts with the claim, so the
+  pointer stays on its screen. Without STOPPING (a crash) the remote's 2 s watchdog applies.
 - **Watchdogs.** The holder releases every key and button it injected after 2 s without any packet
   from the remote (it stays the holder). The remote takes the pointer back after 2 s without any
   packet from the holder: it becomes the holder with its pointer where it was parked.
