@@ -45,6 +45,8 @@ final class Core {
     private var enterSince = 0.0, enterLast = 0.0, enterPos: UInt16 = 0, enterFailAt = -10.0
     private var lastPeer = 0.0, lastAlive = 0.0, aliveSentAt = 0.0
     private var savedPos: UInt16 = 0
+    private var parkedAt = CGPoint.zero           // where this Mac's pointer was hidden
+    private var heldSince = -10.0                 // when an ENTER made this Mac the holder
     private var leavePending: (pos: UInt16, since: Double, last: Double)?
     private var swallowUp: Set<UInt16> = []
     private var cursorHidden = false
@@ -233,7 +235,7 @@ final class Core {
         return true
     }
 
-    fileprivate func onTap(_ type: CGEventType, _ ev: CGEvent) -> Unmanaged<CGEvent>? {
+    func onTap(_ type: CGEventType, _ ev: CGEvent) -> Unmanaged<CGEvent>? {
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
             if let t = tap { CGEvent.tapEnable(tap: t, enable: true) }
             log("tap re-enabled after \(type == .tapDisabledByTimeout ? "timeout" : "user input")")
@@ -245,19 +247,10 @@ final class Core {
         let m = mode, paused = cfg.paused
         os_unfair_lock_unlock(&L)
         if paused { return pass }
-        if m == .driven {
-            // This Mac's own mouse while the other computer drives it: this Mac takes control back at
-            // once (the other computer stops driving), and the pointer then crosses as usual.
-            switch type {
-            case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
-                if ev.getIntegerValueField(.mouseEventDeltaX) != 0 || ev.getIntegerValueField(.mouseEventDeltaY) != 0 { takeBackFromPeer(at: ev.location) }
-            case .leftMouseDown, .rightMouseDown, .otherMouseDown, .scrollWheel: takeBackFromPeer(at: ev.location)
-            default: break
-            }
-            return pass
-        }
-
+        // The pointer is on the other computer: every local key and mouse event goes there.
         if m == .driving { return forward(type, ev) }
+        // The pointer is here (idle, or driven by the other computer's input too): local input acts
+        // here as usual, and pushing past the edge hands the pointer over.
 
         // idle / entering: shortcuts and edge detection
         switch type {
@@ -289,7 +282,7 @@ final class Core {
             let now = mono()
             if atOuterEdge(p, e), pushAmount(dx, dy, e) > 0 {
                 push += pushAmount(dx, dy, e)
-                if push >= cfg.push, m == .idle, now - enterFailAt > 1.0 {
+                if push >= cfg.push, m == .idle || m == .driven, now - enterFailAt > 1.0 {
                     os_unfair_lock_unlock(&L)
                     crossOut(at: p)
                     return pass
@@ -304,6 +297,8 @@ final class Core {
 
     /// The pointer was pushed past the edge at p: ask the other computer to take it (ENTER).
     func crossOut(at p: CGPoint) {
+        guard locked({ !cfg.paused && cfg.macDrivesPeer && peerIP != nil && mono() - enterFailAt > 1.0 }) else { return }
+        if locked({ mode == .driven }) { endDriven(why: "the pointer crossed to the other computer") }
         let sm = locked { () -> Bool? in
             guard mode == .idle else { return nil }
             let now = mono(); mode = .entering; enterSince = now; enterLast = now
@@ -313,18 +308,6 @@ final class Core {
         guard let sm else { return }
         sendEnter()
         if sm { awdl.sync(want: true, force: true) }
-    }
-
-    /// While the other computer drives this Mac, this Mac's own mouse moved: stop being driven and
-    /// tell the other computer to stop driving (LEAVE at the matching place along the edge).
-    func takeBackFromPeer(at p: CGPoint) {
-        let pos = locked { () -> UInt16? in
-            guard mode == .driven else { return nil }
-            let pos = posAlong(clamp(p), drivenEdge); let now = mono(); leavePending = (pos, now, now); return pos
-        }
-        guard let pos else { return }
-        var b: [UInt8] = [0x03]; b.u16(pos); send(b)
-        endDriven(why: "this Mac's own mouse moved")
     }
 
     private func isCmdOnly(_ f: CGEventFlags) -> Bool {
@@ -422,33 +405,44 @@ final class Core {
         modBits.filter { f.rawValue & $0.dev != 0 && $0.hid != 0xE3 && $0.hid != 0xE7 }.map { $0.hid }
     }
 
+    /// The pointer is now on the other computer: hide it here, park it where it is, forward all input.
     private func startDriving() {
+        let here = currentPointer()
         locked {
-            mode = .driving; lastPeer = mono(); lastAlive = 0; push = 0
+            mode = .driving; lastPeer = mono(); lastAlive = 0; push = 0; parkedAt = here
             sendLat.removeAll(); rtt.removeAll()
         }
         if !inputDisabled { CGAssociateMouseAndMouseCursorPosition(0) }
         DispatchQueue.main.async {
-            if !self.cursorHidden && !inputDisabled { CGDisplayHideCursor(CGMainDisplayID()); self.cursorHidden = true }
+            if !self.cursorHidden { if !inputDisabled { CGDisplayHideCursor(CGMainDisplayID()) }; self.cursorHidden = true }
             self.onChange?()
         }
-        log("driving \(otherComputer())")
+        log("the pointer is on \(otherComputer()); this Mac's pointer is hidden")
     }
+    /// Where this Mac's pointer is now (test copies keep their own idea of it).
+    private func currentPointer() -> CGPoint {
+        if inputDisabled { return locked { vpos } }
+        return CGEvent(source: nil)?.location ?? locked { vpos }
+    }
+    /// Test copies: whether the pointer here is hidden.
+    var pointerHidden: Bool { onMain { cursorHidden } }
 
-    /// Ends driving and puts the pointer back. pos nil = where it left.
-    func stopDriving(sendLeave: Bool, pos: UInt16?, why: String) {
-        let (was, p, e) = locked { () -> (Mode, UInt16, Edge) in
+    /// The pointer comes back to this Mac: shown again where it was parked (or, with entry, where it
+    /// comes in). sendLeave: this Mac takes it back (LEAVE), the other computer becomes the remote.
+    func stopDriving(sendLeave: Bool, pos: UInt16?, why: String, entry: Edge? = nil) {
+        let (was, target) = locked { () -> (Mode, CGPoint) in
             let w = mode
             if w == .driving { mode = .idle; push = 0 }
             if sendLeave && w == .driving { let now = mono(); leavePending = (0, now, now) }
-            return (w, pos ?? savedPos, cfg.edge)
+            let t = pos.map { pointAt(entry ?? cfg.edge, $0, inset: 1) } ?? clamp(parkedAt)
+            if w == .driving { vpos = t }
+            return (w, t)
         }
         guard was == .driving else { return }
         if sendLeave { var b: [UInt8] = [0x03]; b.u16(0); send(b) }
-        let target = locked { pointAt(e, p, inset: 3) }
         if !inputDisabled { CGWarpMouseCursorPosition(target); CGAssociateMouseAndMouseCursorPosition(1) }
         DispatchQueue.main.async {
-            if self.cursorHidden { CGDisplayShowCursor(CGMainDisplayID()); self.cursorHidden = false }
+            if self.cursorHidden { if !inputDisabled { CGDisplayShowCursor(CGMainDisplayID()) }; self.cursorHidden = false }
             self.onChange?()
         }
         logStats(why)
@@ -519,16 +513,16 @@ final class Core {
                     onLeave(pos, from)
                 case 0x10:
                     guard let dx = r.i16(), let dy = r.i16() else { break }
-                    if locked({ mode == .driven }) { drivenMove(Double(dx), Double(dy)) }
+                    if holding() { drivenMove(Double(dx), Double(dy)) }
                 case 0x11:
                     guard let b = r.u8(), let d = r.u8() else { break }
-                    if locked({ mode == .driven }) { drivenButton(b, d != 0) }
+                    if holding() { drivenButton(b, d != 0) }
                 case 0x12:
                     guard let dx = r.i16(), let dy = r.i16() else { break }
-                    if locked({ mode == .driven }) { drivenScroll(dx, dy) }
+                    if holding() { drivenScroll(dx, dy) }
                 case 0x13:
                     guard let u = r.u16(), let d = r.u8() else { break }
-                    if locked({ mode == .driven }) { drivenKey(u, d != 0) }
+                    if holding() { drivenKey(u, d != 0) }
                 case 0x1F:
                     ack(0x1F, from)
                 default:
@@ -536,6 +530,23 @@ final class Core {
                 }
             }
         }
+    }
+
+    /// This Mac holds the pointer and may apply the other computer's input: switches idle to driven,
+    /// starting from where the pointer is now.
+    private func holding() -> Bool {
+        let here = currentPointer()
+        let became = locked { () -> Bool? in
+            guard !cfg.paused && cfg.peerDrivesMac else { return nil }
+            if mode == .driven { return false }
+            guard mode == .idle else { return nil }
+            mode = .driven; drivenEdge = cfg.edge; lastPeer = mono(); push = 0; vpos = here
+            buttons = []; keysDown = []; rawDown = []; switcher = nil; flags = 0; scrollAcc = (0, 0)
+            return true
+        }
+        guard let became else { return false }
+        if became { DispatchQueue.main.async { self.onChange?() }; if locked({ cfg.smooth }) { awdl.sync(want: true, force: true) }; log("\(otherComputer())'s keyboard and mouse act on this Mac") }
+        return true
     }
 
     private func onAck(_ a: UInt8) {
@@ -547,29 +558,38 @@ final class Core {
         }
     }
 
+    /// The other computer took the pointer back to its screen: this Mac becomes the remote.
     private func onLeave(_ pos: UInt16, _ from: sockaddr_in) {
         ack(0x03, from)
-        let m = locked { mode }
-        if m == .driving { stopDriving(sendLeave: false, pos: pos, why: "pointer came back") }
-        else if m == .driven { endDriven(why: "the other computer took control back") }
+        let (m, ok) = locked { (mode, !cfg.paused && cfg.macDrivesPeer) }
+        guard m != .driving, ok else { return }
+        if m == .driven { endDriven(why: "the other computer took the pointer back") }
+        locked { if mode == .entering { mode = .idle } }
+        startDriving()
     }
 
+    /// The other computer hands the pointer to this Mac.
     private func onEnter(_ e: Edge, _ pos: UInt16, _ from: sockaddr_in) {
         if locked({ cfg.paused || !cfg.peerDrivesMac }) { return }
-        ack(0x01, from)
         let m = locked { mode }
-        if m == .driven { return }
-        if m == .driving { stopDriving(sendLeave: false, pos: nil, why: "the other computer started driving") }
+        if m == .entering {   // both handed over at once: the lower id keeps its handover
+            if let l = locked({ link }), myID.lexicographicallyPrecedes(l.peerID) { return }
+            locked { mode = .idle }
+        }
+        ack(0x01, from)
+        if (m == .driven || m == .idle) && mono() - locked({ heldSince }) < 1.5 { return }   // a repeat of the ENTER that gave it
+        if m == .driving { stopDriving(sendLeave: false, pos: pos, why: "the pointer came back", entry: e) }
         let p = locked { () -> CGPoint in
-            mode = .driven; drivenEdge = e; lastPeer = mono(); push = 0
+            mode = .driven; drivenEdge = e; lastPeer = mono(); push = 0; heldSince = mono()
             buttons = []; keysDown = []; rawDown = []; switcher = nil; flags = 0; scrollAcc = (0, 0)
             vpos = pointAt(e, pos, inset: 1)
             return vpos
         }
+        if m != .driving, !inputDisabled { CGWarpMouseCursorPosition(p) }
         post(mouse: .mouseMoved, at: p, dx: 0, dy: 0)
         DispatchQueue.main.async { self.onChange?() }
         if locked({ cfg.smooth }) { awdl.sync(want: true, force: true) }
-        log("\(otherComputer()) is driving this Mac")
+        log("the pointer is on this Mac (from \(otherComputer()))")
     }
 
     // MARK: driven side (inject)
@@ -591,13 +611,15 @@ final class Core {
 
     private func drivenMove(_ dx0: Double, _ dy0: Double) {
         var leavePos: UInt16?
+        let here = currentPointer()   // from wherever the pointer is now, whichever mouse moved it last
         let (p, type, btn, dx, dy) = locked { () -> (CGPoint, CGEventType, CGMouseButton, Double, Double) in
             let dx = dx0 * cfg.speed, dy = dy0 * cfg.speed
-            vpos = clamp(CGPoint(x: vpos.x + dx, y: vpos.y + dy))
-            if buttons.isEmpty, atOuterEdge(vpos, drivenEdge), pushAmount(dx, dy, drivenEdge) > 0 {
-                push += pushAmount(dx, dy, drivenEdge)
-                if push >= cfg.push { leavePos = posAlong(vpos, drivenEdge) }
-            } else if !atOuterEdge(vpos, drivenEdge) { push = 0 }
+            vpos = clamp(CGPoint(x: here.x + dx, y: here.y + dy))
+            let e = cfg.edge
+            if buttons.isEmpty, atOuterEdge(vpos, e), pushAmount(dx, dy, e) > 0 {
+                push += pushAmount(dx, dy, e)
+                if push >= cfg.push { leavePos = posAlong(vpos, e) }
+            } else if !atOuterEdge(vpos, e) { push = 0 }
             let t: CGEventType, b: CGMouseButton
             if buttons.contains(1) { t = .leftMouseDragged; b = .left }
             else if buttons.contains(2) { t = .rightMouseDragged; b = .right }
@@ -606,11 +628,7 @@ final class Core {
             return (vpos, t, b, dx, dy)
         }
         post(mouse: type, at: p, dx: dx, dy: dy, button: btn)
-        if let lp = leavePos {
-            var b: [UInt8] = [0x03]; b.u16(lp); send(b)
-            locked { let now = mono(); leavePending = (lp, now, now) }
-            endDriven(why: "pointer left through the edge")
-        }
+        if leavePos != nil { crossOut(at: p) }   // pushed past the edge by the other computer's mouse: hand over
     }
 
     private func drivenButton(_ b: UInt8, _ down: Bool) {

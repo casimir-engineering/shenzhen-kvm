@@ -1,8 +1,8 @@
 # Shenzhen KVM: wire protocol
 
-Two computers on the same network share one keyboard, mouse and clipboard. They are symmetric:
-either one can be the side whose keyboard and mouse are in use ("driver") while the other receives
-the events ("driven"). Folders: `mac/` (the Mac app), `linux/` (the Linux service and its
+Two computers on the same network share one pointer, keyboard and clipboard. They are symmetric:
+the pointer is on one screen at a time (that computer "holds" it), and the keyboards and mice of
+both computers act there. Folders: `mac/` (the Mac app), `linux/` (the Linux service and its
 `shenzhen-kvm` command). Both follow this file exactly; change it here first.
 
 ## Ports
@@ -110,41 +110,68 @@ Because L commits to `n_L` before it sees `n_V`, and V's `n_V` is fixed before i
 computer in the middle cannot choose keys that give both people the same code: it succeeds with
 probability 1 in 10^6 per attempt, and every attempt is a request someone sees and declines.
 
+## One pointer: who holds it
+
+There is one pointer for both computers. At any time it is on exactly one screen; that computer is
+the **holder**, the other is the **remote**.
+
+- The holder shows its pointer. Its own keyboard and mouse act on it as usual, and it applies every
+  event the remote sends (below) from wherever its pointer is at that moment, so nothing jumps when
+  both mice are used one after the other.
+- The remote hides its pointer and keeps it parked (Mac: hidden and detached from the mouse; Linux:
+  its mice held with EVIOCGRAB, its pointer hidden with XFixes). It swallows all its local keyboard
+  and mouse input, including the shortcuts its system keeps for itself (the Mac reads keys at the HID
+  level), and sends it to the holder. So any mouse or keyboard, on either computer, acts on the screen
+  that has the pointer.
+- Only the holder moves the pointer across the edge, whichever mouse pushed it there: when its
+  pointer is pushed past the edge that leads to the other computer (no button held), it hands the
+  pointer over with ENTER and, once it has the ACK, becomes the remote. The holder therefore
+  arbitrates when both mice move at once: their movements add up on its screen, and one crossing
+  happens or none.
+- Each computer starts as the holder of its own pointer. When the other computer is not answering,
+  a computer is the holder.
+- **Race.** Both computers can only believe they hold the pointer at the same time before their first
+  handover (or after a restart). If both send ENTER at once, the computer with the lower id (bytewise)
+  keeps its handover: it does not acknowledge the other's ENTER, and the other acknowledges and takes
+  the pointer. Any ENTER received while not handing over is acknowledged and makes the receiver the
+  holder (a repeated ENTER within 1.5 s of the one that made it the holder is acknowledged again but
+  does not move the pointer).
+
 ## Input channel: UDP port 24800 on both peers
 
 Plaintext = one or more events back to back. All integers big-endian.
 
 | type | name   | body | sent by |
 |------|--------|------|---------|
-| 0x01 | ENTER  | u8 edge (0 left, 1 right, 2 top, 3 bottom: the edge of the DRIVEN screen space the pointer comes in through), u16 pos (0..65535 along that edge, left→right or top→bottom) | driver, when its pointer crosses over; repeated every 200 ms until ACK |
+| 0x01 | ENTER  | u8 edge (0 left, 1 right, 2 top, 3 bottom: the edge of the RECEIVER's screen space the pointer comes in through), u16 pos (0..65535 along that edge, left→right or top→bottom) | the holder, handing the pointer over; repeated every 200 ms until ACK, for at most 1 s (then it stays the holder and does not try again for 1 s). The receiver becomes the holder with its pointer just inside that edge at `pos`; the sender becomes the remote on the ACK |
 | 0x02 | ACK    | u8 of the type acknowledged | either |
-| 0x03 | LEAVE  | u16 pos (0..65535 along the edge, same convention) | driven, when the pointer goes back out through the entry edge; repeated until ACK. Also sent by the driver to take control back (pos ignored) |
-| 0x10 | MOVE   | i16 dx, i16 dy (driver's pointer units; the driven side applies them 1:1 times its `speed` setting) | driver |
-| 0x11 | BUTTON | u8 button (1 left, 2 right, 3 middle, 4 back, 5 forward), u8 down (1/0) | driver |
-| 0x12 | SCROLL | i16 dx, i16 dy in 1/120 notch units (positive dy = the view scrolls down towards the end of the page, as a wheel turned towards the user: Linux REL_WHEEL -1 = dy +120; positive dx = the view scrolls right) | driver |
-| 0x13 | KEY    | u16 USB HID keyboard usage (page 0x07, e.g. 0x04 = A, 0xE0..0xE7 modifiers), u8 down (1/0). One down per press: the driver never sends auto-repeat downs; the driven side generates key repeat itself while a key is held | driver |
-| 0x1F | ALIVE  | none | driver every 500 ms while driving; the driven side answers each ALIVE with ACK(0x1F). The driven side releases all held keys and buttons and ends the session after 2 s without any packet; the driver ends the session (takes control back) after 2 s without any packet from the driven side |
+| 0x03 | LEAVE  | u16 pos (ignored) | the remote, taking the pointer back to its own screen (both Shift keys, or "Bring the mouse back now"): it becomes the holder at once with its pointer where it was parked, and repeats LEAVE every 200 ms until ACK, for at most 1.5 s. The receiver releases everything it injected and becomes the remote |
+| 0x10 | MOVE   | i16 dx, i16 dy (remote's pointer units; the holder applies them 1:1 times its `speed` setting, from its pointer's current position) | remote |
+| 0x11 | BUTTON | u8 button (1 left, 2 right, 3 middle, 4 back, 5 forward), u8 down (1/0) | remote |
+| 0x12 | SCROLL | i16 dx, i16 dy in 1/120 notch units (positive dy = the view scrolls down towards the end of the page, as a wheel turned towards the user: Linux REL_WHEEL -1 = dy +120; positive dx = the view scrolls right) | remote |
+| 0x13 | KEY    | u16 USB HID keyboard usage (page 0x07, e.g. 0x04 = A, 0xE0..0xE7 modifiers), u8 down (1/0). One down per press: the remote never sends auto-repeat downs; the holder generates key repeat itself while a key is held | remote |
+| 0x1F | ALIVE  | none | the remote, every 500 ms; the holder answers each ALIVE with ACK(0x1F) |
 
 Rules:
 - Replies (ACK) go to the source address and port of the packet being answered.
-- Only one side drives at a time. While driving, the driver keeps its own pointer parked and hidden
-  (Mac: hidden and detached from the mouse; Linux: its mice held, its pointer hidden with XFixes) and
-  swallows its local keyboard and mouse events.
-- While driven, the driven side's own mouse takes control back at once: on its first local movement,
-  click or scroll it ends the session (releasing everything it injected) and sends LEAVE with its
-  pointer's place along the entry edge; the pointer then crosses as usual from there.
-- On LEAVE (or timeout) the driver puts its pointer back just inside the edge at `pos`.
-- The driven side starts with all keys up; on session end it releases every key and button it holds.
-- The driver swallows every key while driving, including the shortcuts its system keeps for itself
-  (the Mac reads keys at the HID level), and sends them all; media keys travel as the usages 0xE8
-  play/pause, 0xEA previous, 0xEB next, 0xED volume up, 0xEE volume down, 0xEF mute (the Mac keeps
-  brightness and keyboard light). Modifier mapping is done by the DRIVEN side from `command_as`
-  (`control`, the default: on Linux the Mac's Command acts as Control and its Control as Super; on the
-  Mac, Linux Control acts as Command and Super as Control; `super`: Command and Super correspond, and
-  Control stays Control). Option = Alt both ways. The app switcher keeps its meaning: on Linux, the
-  Mac's Command+Tab becomes Alt+Tab with Alt held until Command is released (Shift+Tab goes back), and
-  its Control+Tab stays Control+Tab; on the Mac, Linux Alt+Tab becomes ⌘Tab held the same way, and
-  Linux Control+Tab stays ⌃Tab.
+- **Watchdogs.** The holder releases every key and button it injected after 2 s without any packet
+  from the remote (it stays the holder). The remote takes the pointer back after 2 s without any
+  packet from the holder: it becomes the holder with its pointer where it was parked.
+- The holder starts with all injected keys up; whenever it stops applying the remote's events (handover,
+  LEAVE, watchdog, sharing switched off) it releases every key and button it injected.
+- When a computer switches sharing off, or the direction that lets the other computer's keyboard
+  and mouse control it, it takes the pointer back (LEAVE) if it is the remote and stops applying the
+  remote's events. A holder hands the pointer over only when its own settings let its keyboard and
+  mouse control the other computer, and a computer accepts ENTER only when its settings let the other
+  computer's keyboard and mouse control it.
+- Media keys travel as the usages 0xE8 play/pause, 0xEA previous, 0xEB next, 0xED volume up, 0xEE
+  volume down, 0xEF mute (the Mac keeps brightness and keyboard light). Modifier mapping is done by
+  the HOLDER from `command_as` (`control`, the default: on Linux the Mac's Command acts as Control and
+  its Control as Super; on the Mac, Linux Control acts as Command and Super as Control; `super`:
+  Command and Super correspond, and Control stays Control). Option = Alt both ways. The app switcher
+  keeps its meaning: on Linux, the Mac's Command+Tab becomes Alt+Tab with Alt held until Command is
+  released (Shift+Tab goes back), and its Control+Tab stays Control+Tab; on the Mac, Linux Alt+Tab
+  becomes ⌘Tab held the same way, and Linux Control+Tab stays ⌃Tab.
 - Both peers send ENTER/LEAVE/BUTTON/KEY immediately, one datagram each; MOVE and SCROLL may be
   merged only with events already pending in the same event-loop turn (no timers, no batching delay).
 
@@ -185,7 +212,7 @@ files arrive, it is cancelled, its FILES_BEGIN connection fails, or 10 minutes p
 side holds back a paste shortcut (Command+V on the Mac; Control+V / Control+Shift+V on Linux) and
 performs it when the files are in place. CLIP_GET of an empty clipboard never replaces a non-empty one.
 
-## Dedicated shortcuts (`usual_shortcuts` false; handled by whichever side is the DRIVER)
+## Dedicated shortcuts (`usual_shortcuts` false; handled by the computer whose keyboard is used)
 
 "Here" = the computer the pointer is on right now; "there" = the other one.
 - Command+Shift+C (Control+Shift+C on a Linux keyboard): copy the selection here (the normal copy

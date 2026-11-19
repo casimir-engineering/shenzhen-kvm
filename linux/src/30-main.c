@@ -17,7 +17,7 @@ static int injected_down[KEY_CNT];    /* keys held on the virtual keyboard */
 static int btn_down[8];
 static double wheel_acc_y, wheel_acc_x;
 static int64_t last_rx_ms, next_retx_ms, deadline_ms, next_alive_ms, cooldown_ms, last_query_ms;
-static uint16_t leave_pos, enter_pos;
+static uint16_t enter_pos;
 static int query_out, pos_dirty, edge_pushes;
 static char last_error[256] = "";
 static int64_t last_peer_seen_ms = -1;
@@ -169,22 +169,19 @@ static void end_driven(const char *why) {
     if (state != DRIVEN && state != LEAVING) return;
     release_all(); state = IDLE; logmsg("session ended: %s", why);
 }
-/* This computer's own mouse while the peer drives it: take control back at once (the peer stops
-   driving); the pointer then crosses as usual. */
-static void take_back(void) {
-    if (state != DRIVEN) return;
-    leave_pos = pos_along(entry_edge, px, py);
-    release_all(); state = LEAVING; send_leave(leave_pos); next_retx_ms = mono_ms() + 200; deadline_ms = mono_ms() + 2000;
-    logmsg("this computer's own mouse moved: control taken back from %s", lk.peer_name);
-}
+static double park_x, park_y;          /* where this computer's pointer was hidden */
+static int64_t held_since_ms = -10000, leave_until_ms, next_leave_ms;
+/* The pointer goes to the peer (this computer becomes the remote): hide it here, hold the mice,
+   forward all input. */
 static void start_driving(void) {
     release_all();
+    park_x = px; park_y = py;
     grab_mice(1);
     state = DRIVING; last_rx_ms = mono_ms(); next_alive_ms = last_rx_ms + 500;
     memset(mac_down, 0, sizeof mac_down);
     for (int k = 1; k < 256; k++) if (phys_down[k] && key_to_usage[k] >= 0xE0) send_key_mac(key_to_usage[k], 1);  /* held modifiers */
     tell_here();
-    logmsg("driving %s", lk.peer_name);
+    logmsg("the pointer is on %s; hidden here", lk.peer_name);
 }
 static void stop_driving(const char *why, int have_pos, uint16_t pos) {
     if (state != DRIVING) return;
@@ -192,10 +189,28 @@ static void stop_driving(const char *why, int have_pos, uint16_t pos) {
     grab_mice(0);
     state = IDLE; cooldown_ms = mono_ms() + 400; edge_pushes = 0;
     double x, y;
-    if (have_pos) { edge_point(cfg.edge, pos, 3, &x, &y); place_pointer(x, y); }
-    else { edge_point(cfg.edge, enter_pos, 3, &x, &y); place_pointer(x, y); }
+    if (have_pos) { edge_point(cfg.edge, pos, 1, &x, &y); place_pointer(x, y); }
+    else place_pointer(park_x, park_y);   /* back where it was hidden */
     tell_here();
-    logmsg("pointer back here: %s", why);
+    logmsg("the pointer is back here: %s", why);
+}
+/* This computer holds the pointer and may apply the peer's input (from where the pointer is now). */
+static int holding(void) {
+    if (!st.sharing || !st.peer_drives) return 0;
+    if (state == DRIVEN) return 1;
+    if (state != IDLE) return 0;
+    release_all(); state = DRIVEN; entry_edge = cfg.edge; wheel_acc_x = wheel_acc_y = 0;
+    pos_dirty = 1;   /* where the pointer really is, in case it moved without this computer's mice */
+    logmsg("%s's keyboard and mouse act here", lk.peer_name);
+    return 1;
+}
+/* The pointer was pushed past the edge here (by either mouse): hand it to the peer (ENTER). */
+static void hand_over(double x, double y) {
+    if (!st.sharing || !st.drives_peer || !shm->peer_ip || mono_ms() < cooldown_ms) return;
+    if (state == DRIVEN) release_all();
+    if (state != IDLE && state != DRIVEN) return;
+    enter_pos = pos_along(cfg.edge, x, y); edge_pushes = 0;
+    state = ENTERING; send_enter(); next_retx_ms = mono_ms() + 200; deadline_ms = mono_ms() + 1000;
 }
 
 /* MOVE timing while driven. The sender's nonce counter is its send time in microseconds (wall clock),
@@ -284,34 +299,31 @@ static void handle_udp(void) {
             if (t == 0x01 && i + 4 <= ml) {          /* ENTER */
                 int edge = m[i + 1] & 3; uint16_t pos = get16(m + i + 2); i += 4;
                 if (!st.sharing || !st.peer_drives) continue;   /* switched off: the peer's pointer stays there */
+                if (state == ENTERING && memcmp(my_id, lk.peer_id, 16) < 0) continue;   /* both handed over at once: the lower id keeps its handover */
                 send_ack(0x01, &src);
-                if (state == DRIVING) stop_driving("the other computer took over", 0, 0);
-                if (state != DRIVEN) {
-                    release_all(); state = DRIVEN; entry_edge = edge; wheel_acc_x = wheel_acc_y = 0;
-                    double x, y; edge_point(edge, pos, 0, &x, &y); place_pointer(x, y);
-                    logmsg("%s drives this computer (in through the %s edge)", lk.peer_name, EDGE_NAMES[edge]);
-                }
+                if ((state == DRIVEN || state == IDLE) && mono_ms() - held_since_ms < 1500) continue;   /* a repeat of the ENTER that gave it */
+                if (state == DRIVING) stop_driving("it came back", 1, pos);
+                release_all(); state = DRIVEN; entry_edge = edge; wheel_acc_x = wheel_acc_y = 0; held_since_ms = mono_ms();
+                double x, y; edge_point(edge, pos, 0, &x, &y); place_pointer(x, y);
+                logmsg("the pointer is here (from %s, in through the %s edge)", lk.peer_name, EDGE_NAMES[edge]);
             } else if (t == 0x02 && i + 2 <= ml) {   /* ACK */
                 uint8_t a = m[i + 1]; i += 2;
                 if (a == 0x01 && state == ENTERING) start_driving();
-                else if (a == 0x03 && state == LEAVING) { state = IDLE; logmsg("%s has the pointer again", lk.peer_name); }
+                else if (a == 0x03) leave_until_ms = 0;
             } else if (t == 0x03 && i + 3 <= ml) {   /* LEAVE */
                 uint16_t pos = get16(m + i + 1); i += 3;
-                send_ack(0x03, &src);
-                if (state == DRIVING) stop_driving("pointer came back", 1, pos);
-                else if (state == DRIVEN || state == LEAVING) { end_driven("the other computer took control back"); }
+                (void)pos; send_ack(0x03, &src);
+                /* the peer took the pointer back to its screen: this computer becomes the remote */
+                if (state != DRIVING && st.sharing && st.drives_peer) { if (state == DRIVEN) end_driven("the other computer took the pointer back"); state = IDLE; start_driving(); }
             } else if (t == 0x10 && i + 5 <= ml) {   /* MOVE */
                 int dx = (int16_t)get16(m + i + 1), dy = (int16_t)get16(m + i + 3); i += 5;
-                if (state != DRIVEN) continue;
+                if (!holding()) continue;
                 double nx = px + dx * cfg.speed, ny = py + dy * cfg.speed;
                 int nob = !btn_down[1] && !btn_down[2] && !btn_down[3];
-                int out = (entry_edge == 0 && nx < 0) || (entry_edge == 1 && nx > scr_w - 1) || (entry_edge == 2 && ny < 0) || (entry_edge == 3 && ny > scr_h - 1);
-                if (out && nob) {
+                int out = (cfg.edge == 0 && nx < 0) || (cfg.edge == 1 && nx > scr_w - 1) || (cfg.edge == 2 && ny < 0) || (cfg.edge == 3 && ny > scr_h - 1);
+                if (out && nob && st.drives_peer) {   /* pushed past the edge by the peer's mouse: hand over */
                     double cx = nx < 0 ? 0 : nx > scr_w - 1 ? scr_w - 1 : nx, cy = ny < 0 ? 0 : ny > scr_h - 1 ? scr_h - 1 : ny;
-                    leave_pos = pos_along(entry_edge, cx, cy);
-                    release_all(); state = LEAVING; send_leave(leave_pos); next_retx_ms = mono_ms() + 200; deadline_ms = mono_ms() + 2000;
-                    place_pointer(cx, cy);
-                    logmsg("pointer left through the %s edge", EDGE_NAMES[entry_edge]);
+                    place_pointer(cx, cy); hand_over(cx, cy);
                     continue;
                 }
                 px = nx; py = ny;
@@ -322,11 +334,11 @@ static void handle_udp(void) {
             } else if (t == 0x11 && i + 3 <= ml) {   /* BUTTON */
                 int b = m[i + 1], d = m[i + 2] ? 1 : 0; i += 3;
                 static const int map[] = {0, BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA};
-                if (state != DRIVEN || b < 1 || b > 5) continue;
+                if (b < 1 || b > 5 || !holding()) continue;
                 btn_down[b] = d; ev(EV_KEY, map[b], d); moved = 1;
             } else if (t == 0x12 && i + 5 <= ml) {   /* SCROLL */
                 int dx = (int16_t)get16(m + i + 1), dy = (int16_t)get16(m + i + 3); i += 5;
-                if (state != DRIVEN) continue;
+                if (!holding()) continue;
                 if (dy) { ev(EV_REL, REL_WHEEL_HI_RES, -dy); wheel_acc_y += -dy; }
                 if (dx) { ev(EV_REL, REL_HWHEEL_HI_RES, dx); wheel_acc_x += dx; }
                 int ny = (int)(wheel_acc_y / 120), nx = (int)(wheel_acc_x / 120);
@@ -413,8 +425,8 @@ static void handle_dev(struct dev *d) {
             int other = phys_down[KEY_LEFTALT] || phys_down[KEY_RIGHTALT] || phys_down[KEY_LEFTMETA] || phys_down[KEY_RIGHTMETA];
             if (v == 1 && (c == KEY_C || c == KEY_V) && ctl && sh && !other && hsock >= 0 && !st.usual && st.clipboard && st.sharing) { swallowed[c] = 1; local_shortcut(c); continue; }
             if (state == DRIVING) {
-                if (phys_down[KEY_LEFTSHIFT] && phys_down[KEY_RIGHTSHIFT]) {
-                    send_leave(0); send_leave(0);
+                if (phys_down[KEY_LEFTSHIFT] && phys_down[KEY_RIGHTSHIFT]) {   /* take the pointer back */
+                    send_leave(0); leave_until_ms = mono_ms() + 1500; next_leave_ms = mono_ms() + 200;
                     stop_driving("both Shift keys", 0, 0);
                     continue;
                 }
@@ -427,7 +439,6 @@ static void handle_dev(struct dev *d) {
             switch (x->code) { case BTN_LEFT: b = 1; break; case BTN_RIGHT: b = 2; break; case BTN_MIDDLE: b = 3; break;
                                case BTN_SIDE: case BTN_BACK: b = 4; break; case BTN_EXTRA: case BTN_FORWARD: b = 5; break; }
             if (x->value) d->btns |= 1 << b; else d->btns &= ~(1 << b);
-            if (state == DRIVEN && x->value == 1) take_back();
             if (state == DRIVING && b && x->value != 2) {
                 flush_motion(d);
                 uint8_t m[3] = {0x11, (uint8_t)b, (uint8_t)(x->value ? 1 : 0)}; udp_send(m, 3);
@@ -445,11 +456,16 @@ static void handle_dev(struct dev *d) {
             if (state == DRIVING) { flush_motion(d); continue; }
             int dx = d->dx, dy = d->dy; d->dx = d->dy = d->wx = d->wy = 0;
             if (!dx && !dy) continue;
-            if (state == DRIVEN) { take_back(); pos_dirty = 1; }
+            int hold = state == IDLE || state == DRIVEN;
+            if (hold) {   /* this computer's own mouse moved the pointer: follow it (the query below corrects it) */
+                px += dx; py += dy;
+                if (px < 0) px = 0; if (py < 0) py = 0; if (px > scr_w - 1) px = scr_w - 1; if (py > scr_h - 1) py = scr_h - 1;
+                pos_dirty = 1;
+            }
             int64_t now = mono_ms();
-            if (state == IDLE && now >= cooldown_ms && !(d->btns & 0x0E) && toward_edge(dx, dy) && hsock >= 0) {
+            if (hold && now >= cooldown_ms && !(d->btns & 0x0E) && toward_edge(dx, dy) && hsock >= 0) {
                 if (!query_out && now - last_query_ms >= 8) query(1);
-            } else if (state == IDLE && !toward_edge(dx, dy)) edge_pushes = 0;
+            } else if (hold && !toward_edge(dx, dy)) edge_pushes = 0;
         }
     }
 }

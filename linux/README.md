@@ -6,10 +6,11 @@ Both follow `../PROTOCOL.md`.
 
 ## What a person sees
 
-- **Pointer and keyboard.** Push the pointer past the side of the screen that leads to the other
-  computer (no button held): it carries on there, with this computer's keyboard. Push it back the same
-  way, or press both Shift keys. The other way round, the other computer's pointer arrives here at the
-  same place along the edge, and its keyboard types here. The Mac's ⌘ acts as Control (⌘C copies),
+- **One pointer.** The pointer is on one screen at a time, and both computers' keyboards and mice
+  act there, from wherever the pointer is. Push it past the side of the screen that leads to the other
+  computer (no button held, with either mouse) and it carries on there at the same place along the
+  edge; the screen it left hides its pointer. Both Shift keys bring it back to the computer whose
+  keyboard you're using. The Mac's ⌘ acts as Control (⌘C copies),
   or as Super (a setting); ⌘Tab switches windows here (Alt+Tab, held while ⌘ is held), ⌃Tab stays
   Control+Tab, and the Mac's volume and playback keys work here.
 - **Clipboard.** Copy anything here (any copy: Ctrl+C, a menu, right-click) and paste it on the other
@@ -26,9 +27,8 @@ Both follow `../PROTOCOL.md`.
   computer visible, the computers that are visible, the code to compare, forgetting the link), which
   side the other computer's screen is on, the clipboard settings and the transfers with their progress.
   The settings are shared with the other computer's window.
-- While this computer's keyboard and mouse control the other computer, the pointer here is hidden;
-  it shows again where it left when it comes back. Moving this computer's own mouse while the other
-  computer's keyboard is in use here takes control back at once.
+- While the pointer is on the other computer, this computer's pointer is hidden and its keyboard and
+  mice act there; it shows again when the pointer comes back.
 - If the other computer goes silent for 2 seconds while its keyboard is in use here, every key and
   button it was holding is released.
 - **Which desktop.** The service uses the desktop on the lowest-numbered X display (the main one,

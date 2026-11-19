@@ -143,14 +143,12 @@ static void handle_helper(void) {
     else if (t == 'X' && b.n >= 24) {
         int32_t r[6]; memcpy(r, b.p, 24); query_out = 0;
         if (r[3] > 0 && r[4] > 0) { scr_w = r[3]; scr_h = r[4]; }
-        if (r[5] == 2 && state == DRIVEN) { px = r[0]; py = r[1]; pos_dirty = 0; }
-        else if (r[5] == 1 && state == IDLE && mono_ms() >= cooldown_ms && st.sharing && st.drives_peer && shm->peer_ip) {
+        int hold = state == IDLE || state == DRIVEN;
+        if ((r[5] == 1 || r[5] == 2) && hold) { px = r[0]; py = r[1]; pos_dirty = 0; }
+        if (r[5] == 1 && hold && mono_ms() >= cooldown_ms && st.sharing && st.drives_peer && shm->peer_ip) {
             int at = (cfg.edge == 0 && r[0] <= 0) || (cfg.edge == 1 && r[0] >= scr_w - 1) || (cfg.edge == 2 && r[1] <= 0) || (cfg.edge == 3 && r[1] >= scr_h - 1);
             if (at && !(r[2] & (Button1Mask | Button2Mask | Button3Mask))) {
-                if (++edge_pushes >= 2) {
-                    edge_pushes = 0; enter_pos = pos_along(cfg.edge, r[0], r[1]);
-                    state = ENTERING; send_enter(); next_retx_ms = mono_ms() + 200; deadline_ms = mono_ms() + 1000;
-                }
+                if (++edge_pushes >= 2) hand_over(r[0], r[1]);
             } else edge_pushes = 0;
         }
         if (r[5] == 3) { px = r[0]; py = r[1]; }
@@ -168,15 +166,16 @@ static void handle_agent(void) {
         if (hsock >= 0 && peer_online()) { hsend(hsock, 'f', NULL, 0); forget_deadline = mono_ms() + 3000; } else forget_link();
     }
     else if (t == 'B') {
-        if (state == DRIVING) { send_leave(0); stop_driving("asked from the menu", 0, 0); }
-        else if (state == DRIVEN) { send_leave(pos_along(entry_edge, px, py)); end_driven("asked from the menu"); }
+        if (state == DRIVING) { send_leave(0); leave_until_ms = mono_ms() + 1500; next_leave_ms = mono_ms() + 200; stop_driving("asked from the menu", 0, 0); }
+
     }
     else if (t == 'q') { buf_t d = {0}; diag_json(&d); hsend(asock, 'D', d.p, d.n); bfree(&d); tell_agent(1); }
 }
 
 static int64_t next_deadline(void) {
     int64_t d = INT64_MAX;
-    if (state == ENTERING || state == LEAVING) { d = next_retx_ms < deadline_ms ? next_retx_ms : deadline_ms; }
+    if (state == ENTERING) { d = next_retx_ms < deadline_ms ? next_retx_ms : deadline_ms; }
+    if (leave_until_ms && next_leave_ms < d) d = next_leave_ms;
     if (state == DRIVEN) d = last_rx_ms + 2000;
     if (state == DRIVING) { d = next_alive_ms < last_rx_ms + 2000 ? next_alive_ms : last_rx_ms + 2000; }
     if (hsock < 0 && linked && helper_restart_at < d) d = helper_restart_at;
@@ -197,12 +196,13 @@ static void timers(void) {
     if (asock < 0 && now >= agent_restart_at) { agent_start(); tell_agent(1); }
     if (forget_deadline && now >= forget_deadline) { forget_deadline = 0; forget_link(); }
     if (paste_wait && now >= paste_wait_until) { paste_wait = 0; paste_deferred = 0; set_error("files from %s did not arrive; the held paste was dropped", lk.peer_name); }
+    if (leave_until_ms) {   /* LEAVE repeated until the peer confirms it gave the pointer back */
+        if (now >= leave_until_ms) leave_until_ms = 0;
+        else if (now >= next_leave_ms) { send_leave(0); next_leave_ms = now + 200; }
+    }
     if (state == ENTERING) {
         if (now >= deadline_ms) { state = IDLE; cooldown_ms = now + 1000; set_error("%s did not answer when the pointer reached the %s edge", lk.peer_name, EDGE_NAMES[cfg.edge]); }
         else if (now >= next_retx_ms) { send_enter(); next_retx_ms = now + 200; }
-    } else if (state == LEAVING) {
-        if (now >= deadline_ms) { state = IDLE; set_error("%s did not confirm the pointer coming back", lk.peer_name); }
-        else if (now >= next_retx_ms) { send_leave(leave_pos); next_retx_ms = now + 200; }
     } else if (state == DRIVEN) {
         if (now - last_rx_ms >= 2000) { end_driven("no packet for 2 s"); set_error("%s went silent while its keyboard was in use here; keys released", lk.peer_name); }
     } else if (state == DRIVING) {
@@ -304,7 +304,7 @@ static int run(void) {
         }
         if (q[6].revents & POLLIN) handle_present6();
         for (int i = base; i < n; i++) if (q[i].revents) { struct dev *d = &devs[map[i - base]]; if (q[i].revents & (POLLERR | POLLHUP)) dev_close(d); else handle_dev(d); }
-        if (state == DRIVEN && pos_dirty && !query_out) query(2);
+        if ((state == DRIVEN || state == IDLE) && pos_dirty && !query_out && hsock >= 0) query(2);
         timers();
     }
     if (state == DRIVING) { send_leave(0); stop_driving("service stopping", 0, 0); }
