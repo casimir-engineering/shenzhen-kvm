@@ -144,7 +144,9 @@ static void handle_helper(void) {
         int32_t r[6]; memcpy(r, b.p, 24); query_out = 0;
         if (r[3] > 0 && r[4] > 0) { scr_w = r[3]; scr_h = r[4]; }
         int hold = state == IDLE || state == DRIVEN;
-        if ((r[5] == 1 || r[5] == 2) && hold) { px = r[0]; py = r[1]; pos_dirty = 0; }
+        /* the desktop's pointer, unless the peer's moves were injected meanwhile (they may not be
+           applied yet: taking this answer would lose them); then ask again later */
+        if ((r[5] == 1 || r[5] == 2) && hold) { if (injected_since_query) pos_dirty = 1; else { px = r[0]; py = r[1]; pos_dirty = 0; } }
         if (r[5] == 1 && hold && mono_ms() >= cooldown_ms && st.sharing && st.drives_peer && shm->peer_ip) {
             int at = (cfg.edge == 0 && r[0] <= 0) || (cfg.edge == 1 && r[0] >= scr_w - 1) || (cfg.edge == 2 && r[1] <= 0) || (cfg.edge == 3 && r[1] >= scr_h - 1);
             if (at && !(r[2] & (Button1Mask | Button2Mask | Button3Mask))) {

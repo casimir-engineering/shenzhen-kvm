@@ -47,6 +47,8 @@ final class Core {
     private var savedPos: UInt16 = 0
     private var parkedAt = CGPoint.zero           // where this Mac's pointer was hidden
     private var heldSince = -10.0                 // when an ENTER made this Mac the holder
+    private var localMoved = false                // this Mac's own mouse moved since the last remote move
+    private var lastPostAt = 0.0
     private var leavePending: (pos: UInt16, since: Double, last: Double)?
     private var swallowUp: Set<UInt16> = []
     private var cursorHidden = false
@@ -249,6 +251,7 @@ final class Core {
         if paused { return pass }
         // The pointer is on the other computer: every local key and mouse event goes there.
         if m == .driving { return forward(type, ev) }
+        if type == .mouseMoved || type == .leftMouseDragged || type == .rightMouseDragged || type == .otherMouseDragged { locked { localMoved = true } }
         // The pointer is here (idle, or driven by the other computer's input too): local input acts
         // here as usual, and pushing past the edge hands the pointer over.
 
@@ -611,10 +614,16 @@ final class Core {
 
     private func drivenMove(_ dx0: Double, _ dy0: Double) {
         var leavePos: UInt16?
-        let here = currentPointer()   // from wherever the pointer is now, whichever mouse moved it last
+        // From where the pointer is: our own running position while only the other computer's mouse
+        // moves it (events just posted may not be applied yet, so reading the pointer back would lose
+        // moves), the real position once this Mac's own mouse moved it or after a pause.
+        let real = currentPointer()
         let (p, type, btn, dx, dy) = locked { () -> (CGPoint, CGEventType, CGMouseButton, Double, Double) in
             let dx = dx0 * cfg.speed, dy = dy0 * cfg.speed
-            vpos = clamp(CGPoint(x: here.x + dx, y: here.y + dy))
+            let now = mono()
+            let base = localMoved || now - lastPostAt > 0.3 ? real : vpos
+            localMoved = false; lastPostAt = now
+            vpos = clamp(CGPoint(x: base.x + dx, y: base.y + dy))
             let e = cfg.edge
             if buttons.isEmpty, atOuterEdge(vpos, e), pushAmount(dx, dy, e) > 0 {
                 push += pushAmount(dx, dy, e)

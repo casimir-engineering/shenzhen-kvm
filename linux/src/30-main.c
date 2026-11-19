@@ -18,7 +18,7 @@ static int btn_down[8];
 static double wheel_acc_y, wheel_acc_x;
 static int64_t last_rx_ms, next_retx_ms, deadline_ms, next_alive_ms, cooldown_ms, last_query_ms;
 static uint16_t enter_pos;
-static int query_out, pos_dirty, edge_pushes;
+static int query_out, pos_dirty, edge_pushes, injected_since_query;
 static char last_error[256] = "";
 static int64_t last_peer_seen_ms = -1;
 static uint64_t lat_n, lat_sum_ns, lat_max_ns, lat_hist[12];  /* <25,50,100,200,500us,1,2,5,10,20,50ms,more */
@@ -163,7 +163,7 @@ static void edge_point(int edge, uint16_t pos, int inset, double *x, double *y) 
     }
 }
 
-static void query(uint8_t tag) { if (hsock >= 0 && !query_out) { query_out = 1; last_query_ms = mono_ms(); hsend(hsock, 'Q', &tag, 1); } }
+static void query(uint8_t tag) { if (hsock >= 0 && !query_out) { query_out = 1; injected_since_query = 0; last_query_ms = mono_ms(); hsend(hsock, 'Q', &tag, 1); } }
 
 static void end_driven(const char *why) {
     if (state != DRIVEN && state != LEAVING) return;
@@ -330,7 +330,7 @@ static void handle_udp(void) {
                 if (px < 0) px = 0; if (py < 0) py = 0; if (px > scr_w - 1) px = scr_w - 1; if (py > scr_h - 1) py = scr_h - 1;
                 ev(EV_ABS, ABS_X, (int)(((int64_t)(int)px * 65536 + 32768) / scr_w));
                 ev(EV_ABS, ABS_Y, (int)(((int64_t)(int)py * 65536 + 32768) / scr_h));
-                moved = 1;
+                moved = 1; injected_since_query = 1;
             } else if (t == 0x11 && i + 3 <= ml) {   /* BUTTON */
                 int b = m[i + 1], d = m[i + 2] ? 1 : 0; i += 3;
                 static const int map[] = {0, BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA};
