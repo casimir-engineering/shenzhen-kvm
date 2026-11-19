@@ -169,6 +169,14 @@ static void end_driven(const char *why) {
     if (state != DRIVEN && state != LEAVING) return;
     release_all(); state = IDLE; logmsg("session ended: %s", why);
 }
+/* This computer's own mouse while the peer drives it: take control back at once (the peer stops
+   driving); the pointer then crosses as usual. */
+static void take_back(void) {
+    if (state != DRIVEN) return;
+    leave_pos = pos_along(entry_edge, px, py);
+    release_all(); state = LEAVING; send_leave(leave_pos); next_retx_ms = mono_ms() + 200; deadline_ms = mono_ms() + 2000;
+    logmsg("this computer's own mouse moved: control taken back from %s", lk.peer_name);
+}
 static void start_driving(void) {
     release_all();
     grab_mice(1);
@@ -419,6 +427,7 @@ static void handle_dev(struct dev *d) {
             switch (x->code) { case BTN_LEFT: b = 1; break; case BTN_RIGHT: b = 2; break; case BTN_MIDDLE: b = 3; break;
                                case BTN_SIDE: case BTN_BACK: b = 4; break; case BTN_EXTRA: case BTN_FORWARD: b = 5; break; }
             if (x->value) d->btns |= 1 << b; else d->btns &= ~(1 << b);
+            if (state == DRIVEN && x->value == 1) take_back();
             if (state == DRIVING && b && x->value != 2) {
                 flush_motion(d);
                 uint8_t m[3] = {0x11, (uint8_t)b, (uint8_t)(x->value ? 1 : 0)}; udp_send(m, 3);
@@ -436,7 +445,7 @@ static void handle_dev(struct dev *d) {
             if (state == DRIVING) { flush_motion(d); continue; }
             int dx = d->dx, dy = d->dy; d->dx = d->dy = d->wx = d->wy = 0;
             if (!dx && !dy) continue;
-            if (state == DRIVEN) pos_dirty = 1;
+            if (state == DRIVEN) { take_back(); pos_dirty = 1; }
             int64_t now = mono_ms();
             if (state == IDLE && now >= cooldown_ms && !(d->btns & 0x0E) && toward_edge(dx, dy) && hsock >= 0) {
                 if (!query_out && now - last_query_ms >= 8) query(1);

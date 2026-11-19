@@ -25,6 +25,17 @@ static pid_t push_pid;                /* background file push */
 typedef struct { int type; unsigned long serial; Bool send_event; Display *display; Window window; int subtype;
                  Window owner; Atom selection; Time timestamp; Time selection_timestamp; } FixSelEvent;
 static int fix_event = -1;
+static void (*fix_hide)(Display *, Window), (*fix_show)(Display *, Window);
+static int cursor_hidden;
+/* While this computer drives the peer, its own pointer is hidden (it stays where it left). */
+static void cursor_follow(void) {
+    int want = !here;
+    if (!dpy || !fix_hide || !fix_show || want == cursor_hidden) return;
+    if (want) fix_hide(dpy, xroot); else fix_show(dpy, xroot);
+    XFlush(dpy); cursor_hidden = want;
+    uint8_t h = cursor_hidden; hsend(hfd, 'K', &h, 1);
+    logmsg("pointer %s", want ? "hidden here (it is on the other computer)" : "shown here again");
+}
 
 static void herr(const char *fmt, ...) {
     char m[300]; va_list a; va_start(a, fmt); vsnprintf(m, sizeof m, fmt, a); va_end(a);
@@ -34,10 +45,13 @@ static int xerr(Display *d, XErrorEvent *e) { (void)d; (void)e; return 0; }
 static int xioerr(Display *d) { (void)d; logmsg("lost the desktop's X server"); _exit(3); }
 
 /* Find the desktop X server (Xwayland or Xorg) and its auth file from its command line. */
+/* The desktop's X server: the one named "display" in config.json, else the lowest display number
+   (the main desktop; a second screen may run a second desktop on the next number). */
 static int find_display(char *disp, size_t dn, char *auth, size_t an, uid_t *owner) {
-    DIR *d = opendir("/proc"); struct dirent *e; int found = 0;
+    DIR *d = opendir("/proc"); struct dirent *e; int found = 0, best = INT_MAX;
+    char bd[32] = "", ba[512] = ""; uid_t bo = 0;
     if (!d) return 0;
-    while (!found && (e = readdir(d))) {
+    while ((e = readdir(d))) {
         if (!isdigit((unsigned char)e->d_name[0])) continue;
         char p[64], c[4096]; snprintf(p, sizeof p, "/proc/%s/cmdline", e->d_name);
         int fd = open(p, O_RDONLY); if (fd < 0) continue;
@@ -45,14 +59,18 @@ static int find_display(char *disp, size_t dn, char *auth, size_t an, uid_t *own
         const char *b = strrchr(c, '/'); b = b ? b + 1 : c;
         if (strcmp(b, "Xwayland") && strcmp(b, "Xorg") && strcmp(b, "X") && strcmp(b, "Xvfb")) continue;
         struct stat ps; snprintf(p, sizeof p, "/proc/%s", e->d_name); if (stat(p, &ps) == 0) *owner = ps.st_uid;
-        disp[0] = auth[0] = 0;
+        char dd[32] = "", aa[512] = "";
         for (char *a = c; a < c + n; a += strlen(a) + 1) {
-            if (a[0] == ':' && isdigit((unsigned char)a[1])) snprintf(disp, dn, "%s", a);
-            if (!strcmp(a, "-auth") && a + strlen(a) + 1 < c + n) snprintf(auth, an, "%s", a + strlen(a) + 1);
+            if (a[0] == ':' && isdigit((unsigned char)a[1])) snprintf(dd, sizeof dd, "%s", a);
+            if (!strcmp(a, "-auth") && a + strlen(a) + 1 < c + n) snprintf(aa, sizeof aa, "%s", a + strlen(a) + 1);
         }
-        found = disp[0] != 0;
+        if (!dd[0]) continue;
+        int num = atoi(dd + 1);
+        if (want_display[0] ? !strcmp(dd, want_display) : num < best) { best = want_display[0] ? -1 : num; snprintf(bd, sizeof bd, "%s", dd); snprintf(ba, sizeof ba, "%s", aa); bo = *owner; found = 1; }
+        if (want_display[0] && found) break;
     }
     closedir(d);
+    if (found) { snprintf(disp, dn, "%s", bd); snprintf(auth, an, "%s", ba); *owner = bo; }
     return found;
 }
 
@@ -91,10 +109,14 @@ static int x_connect(void) {
     Status (*qv)(Display *, int *, int *) = lib ? dlsym(lib, "XFixesQueryVersion") : NULL;
     void (*ssi)(Display *, Window, Atom, unsigned long) = lib ? dlsym(lib, "XFixesSelectSelectionInput") : NULL;
     int eb, erb, maj = 5, min = 0;
-    if (qe && qv && ssi && qe(dpy, &eb, &erb)) { qv(dpy, &maj, &min); ssi(dpy, xwin, A_CLIP, 1); fix_event = eb; }
+    if (qe && qv && ssi && qe(dpy, &eb, &erb)) {
+        qv(dpy, &maj, &min); ssi(dpy, xwin, A_CLIP, 1); fix_event = eb;
+        fix_hide = dlsym(lib, "XFixesHideCursor"); fix_show = dlsym(lib, "XFixesShowCursor");
+    }
     else herr("cannot watch the clipboard (libXfixes missing): copy and paste between the computers is off");
     XFlush(dpy);
     logmsg("connected to the desktop on %s", disp);
+    cursor_hidden = 0; cursor_follow();
     return 1;
 }
 
@@ -692,7 +714,7 @@ static long sel_timestamp(void) {
 }
 
 static void helper_cmd(uint8_t t, buf_t *b) {
-    if (t == 'H' && b->n >= 1) { here = b->p[0]; return; }
+    if (t == 'H' && b->n >= 1) { here = b->p[0]; cursor_follow(); return; }
     if (t == 'G') {   /* main's current settings */
         char j[4096]; size_t n = b->n < sizeof j - 2 ? b->n : sizeof j - 2; memcpy(j, b->p, n); j[n] = 0;
         parse_local_settings(j); return;

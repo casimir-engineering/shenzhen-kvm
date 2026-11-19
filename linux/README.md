@@ -23,8 +23,16 @@ Both follow `../PROTOCOL.md`.
   computer visible, the computers that are visible, the code to compare, forgetting the link), which
   side the other computer's screen is on, the clipboard settings and the transfers with their progress.
   The settings are shared with the other computer's window.
+- While this computer's keyboard and mouse control the other computer, the pointer here is hidden;
+  it shows again where it left when it comes back. Moving this computer's own mouse while the other
+  computer's keyboard is in use here takes control back at once.
 - If the other computer goes silent for 2 seconds while its keyboard is in use here, every key and
   button it was holding is released.
+- **Which desktop.** The service uses the desktop on the lowest-numbered X display (the main one,
+  `:1` on a computer whose desktop runs there). A computer that runs a second desktop on another
+  display for a second screen (`:2`) keeps sharing with the main one only; `"display": ":2"` in
+  `/etc/shenzhen-kvm/config.json` chooses another. The top-bar app runs once, in the main desktop's
+  session (start it from that session only).
 
 ## Install on a running computer
 

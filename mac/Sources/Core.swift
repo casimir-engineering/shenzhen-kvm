@@ -244,7 +244,18 @@ final class Core {
         os_unfair_lock_lock(&L)
         let m = mode, paused = cfg.paused
         os_unfair_lock_unlock(&L)
-        if paused || m == .driven { return pass }
+        if paused { return pass }
+        if m == .driven {
+            // This Mac's own mouse while the other computer drives it: this Mac takes control back at
+            // once (the other computer stops driving), and the pointer then crosses as usual.
+            switch type {
+            case .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
+                if ev.getIntegerValueField(.mouseEventDeltaX) != 0 || ev.getIntegerValueField(.mouseEventDeltaY) != 0 { takeBackFromPeer(at: ev.location) }
+            case .leftMouseDown, .rightMouseDown, .otherMouseDown, .scrollWheel: takeBackFromPeer(at: ev.location)
+            default: break
+            }
+            return pass
+        }
 
         if m == .driving { return forward(type, ev) }
 
@@ -279,12 +290,8 @@ final class Core {
             if atOuterEdge(p, e), pushAmount(dx, dy, e) > 0 {
                 push += pushAmount(dx, dy, e)
                 if push >= cfg.push, m == .idle, now - enterFailAt > 1.0 {
-                    mode = .entering; enterSince = now; enterLast = now
-                    enterPos = posAlong(p, e); savedPos = enterPos
-                    let sm = cfg.smooth
                     os_unfair_lock_unlock(&L)
-                    sendEnter()
-                    if sm { awdl.sync(want: true, force: true) }
+                    crossOut(at: p)
                     return pass
                 }
             } else if !atOuterEdge(p, e) { push = 0 }
@@ -293,6 +300,31 @@ final class Core {
         default:
             return pass
         }
+    }
+
+    /// The pointer was pushed past the edge at p: ask the other computer to take it (ENTER).
+    func crossOut(at p: CGPoint) {
+        let sm = locked { () -> Bool? in
+            guard mode == .idle else { return nil }
+            let now = mono(); mode = .entering; enterSince = now; enterLast = now
+            enterPos = posAlong(p, cfg.edge); savedPos = enterPos
+            return cfg.smooth
+        }
+        guard let sm else { return }
+        sendEnter()
+        if sm { awdl.sync(want: true, force: true) }
+    }
+
+    /// While the other computer drives this Mac, this Mac's own mouse moved: stop being driven and
+    /// tell the other computer to stop driving (LEAVE at the matching place along the edge).
+    func takeBackFromPeer(at p: CGPoint) {
+        let pos = locked { () -> UInt16? in
+            guard mode == .driven else { return nil }
+            let pos = posAlong(clamp(p), drivenEdge); let now = mono(); leavePending = (pos, now, now); return pos
+        }
+        guard let pos else { return }
+        var b: [UInt8] = [0x03]; b.u16(pos); send(b)
+        endDriven(why: "this Mac's own mouse moved")
     }
 
     private func isCmdOnly(_ f: CGEventFlags) -> Bool {
@@ -395,9 +427,9 @@ final class Core {
             mode = .driving; lastPeer = mono(); lastAlive = 0; push = 0
             sendLat.removeAll(); rtt.removeAll()
         }
-        CGAssociateMouseAndMouseCursorPosition(0)
+        if !inputDisabled { CGAssociateMouseAndMouseCursorPosition(0) }
         DispatchQueue.main.async {
-            if !self.cursorHidden { CGDisplayHideCursor(CGMainDisplayID()); self.cursorHidden = true }
+            if !self.cursorHidden && !inputDisabled { CGDisplayHideCursor(CGMainDisplayID()); self.cursorHidden = true }
             self.onChange?()
         }
         log("driving \(otherComputer())")
@@ -414,8 +446,7 @@ final class Core {
         guard was == .driving else { return }
         if sendLeave { var b: [UInt8] = [0x03]; b.u16(0); send(b) }
         let target = locked { pointAt(e, p, inset: 3) }
-        CGWarpMouseCursorPosition(target)
-        CGAssociateMouseAndMouseCursorPosition(1)
+        if !inputDisabled { CGWarpMouseCursorPosition(target); CGAssociateMouseAndMouseCursorPosition(1) }
         DispatchQueue.main.async {
             if self.cursorHidden { CGDisplayShowCursor(CGMainDisplayID()); self.cursorHidden = false }
             self.onChange?()
@@ -544,6 +575,7 @@ final class Core {
     // MARK: driven side (inject)
 
     private func mk(_ e: CGEvent?) -> CGEvent? {
+        if inputDisabled { return nil }   // test copies never type or point on this Mac
         e?.setIntegerValueField(.eventSourceUserData, value: MAGIC_TAG); return e
     }
 
@@ -665,7 +697,7 @@ final class Core {
         guard let t = map[u] else { return false }
         let e = NSEvent.otherEvent(with: .systemDefined, location: .zero, modifierFlags: NSEvent.ModifierFlags(rawValue: down ? 0xa00 : 0xb00),
                                    timestamp: 0, windowNumber: 0, context: nil, subtype: 8, data1: (t << 16) | ((down ? 0xa : 0xb) << 8), data2: -1)
-        if let c = e?.cgEvent { c.setIntegerValueField(.eventSourceUserData, value: MAGIC_TAG); c.post(tap: .cghidEventTap) }
+        if !inputDisabled, let c = e?.cgEvent { c.setIntegerValueField(.eventSourceUserData, value: MAGIC_TAG); c.post(tap: .cghidEventTap) }
         return true
     }
 

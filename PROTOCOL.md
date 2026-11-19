@@ -128,7 +128,11 @@ Plaintext = one or more events back to back. All integers big-endian.
 Rules:
 - Replies (ACK) go to the source address and port of the packet being answered.
 - Only one side drives at a time. While driving, the driver keeps its own pointer parked and hidden
-  and swallows its local keyboard and mouse events.
+  (Mac: hidden and detached from the mouse; Linux: its mice held, its pointer hidden with XFixes) and
+  swallows its local keyboard and mouse events.
+- While driven, the driven side's own mouse takes control back at once: on its first local movement,
+  click or scroll it ends the session (releasing everything it injected) and sends LEAVE with its
+  pointer's place along the entry edge; the pointer then crosses as usual from there.
 - On LEAVE (or timeout) the driver puts its pointer back just inside the edge at `pos`.
 - The driven side starts with all keys up; on session end it releases every key and button it holds.
 - The driver swallows every key while driving, including the shortcuts its system keeps for itself

@@ -1,4 +1,5 @@
 /* --- presence of the linked peer (PROTOCOL.md PRESENT) --- */
+static int cursor_hidden_here;          /* the helper hid this computer's pointer (it is on the peer) */
 static uint64_t present_high;
 static int64_t next_present_ms, next_sweep_ms, next_ifscan_ms, missing_since_ms, settings_sent_ms;
 static int was_online;
@@ -61,7 +62,7 @@ static void helper_start(void) {
 }
 static void helper_lost(void) {
     if (hsock >= 0) close(hsock);
-    hsock = -1; query_out = 0; pending_copy = pending_paste = 0;
+    hsock = -1; query_out = 0; pending_copy = pending_paste = 0; cursor_hidden_here = 0;
     int stt; waitpid(helper_pid, &stt, 0);
     helper_restart_at = mono_ms() + 1000;
 }
@@ -88,8 +89,8 @@ static void state_json(buf_t *b) {
     struct in_addr a = {shm->peer_ip};
     int nk = 0, nm = 0; for (int i = 0; i < MAXDEV; i++) if (devs[i].fd > 0) { nk += devs[i].kbd; nm += devs[i].mouse; }
     bprintf(b, "{\"linked\": %s, \"peer_name\": ", lk.ok ? "true" : "false"); json_put_str(b, lk.ok ? lk.peer_name : "");
-    bprintf(b, ", \"peer_id\": \"%s\", \"online\": %s, \"peer_address\": \"%s\", \"found_by\": \"%s\", \"mode\": \"%s\", \"desktop\": %s, \"keyboards\": %d, \"mice\": %d, \"paste_waiting\": %s, \"settings\": ",
-            lk.ok ? lk.peer_id_hex : "", peer_online() ? "true" : "false", shm->peer_ip ? inet_ntoa(a) : "", (const char *)shm->found_by, mode,
+    bprintf(b, ", \"peer_id\": \"%s\", \"online\": %s, \"peer_address\": \"%s\", \"found_by\": \"%s\", \"mode\": \"%s\", \"cursor_hidden\": %s, \"desktop\": %s, \"keyboards\": %d, \"mice\": %d, \"paste_waiting\": %s, \"settings\": ",
+            lk.ok ? lk.peer_id_hex : "", peer_online() ? "true" : "false", shm->peer_ip ? inet_ntoa(a) : "", (const char *)shm->found_by, mode, cursor_hidden_here ? "true" : "false",
             hsock >= 0 ? "true" : "false", nk, nm, paste_wait ? "true" : "false");
     settings_json(b, 0);
     bputs(b, ", \"error\": "); json_put_str(b, last_error); bputs(b, "}");
@@ -125,6 +126,7 @@ static void handle_helper(void) {
     if (hrecv(hsock, &t, &b)) { helper_lost(); return; }
     if (t == 'Z' && b.n >= 8) { int32_t s[2]; memcpy(s, b.p, 8); if (s[0] > 0 && s[1] > 0) { scr_w = s[0]; scr_h = s[1]; } }
     else if (t == 'E') { set_error("%.*s", (int)b.n, b.p); tell_agent(0); }
+    else if (t == 'K' && b.n) { cursor_hidden_here = b.p[0]; tell_agent(0); }
     else if (t == 'T' && asock >= 0) hsend(asock, 'T', b.p, b.n);
     else if (t == 'N' && b.n) { snprintf(lk.peer_name, sizeof lk.peer_name, "%.*s", (int)b.n, b.p); tell_agent(0); }
     else if (t == 'G') {   /* settings from the peer */

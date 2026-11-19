@@ -5,6 +5,7 @@ static struct {
     int cmd_l, cmd_r;       /* evdev keys for the Mac's Command */
     int ctl_l, ctl_r;       /* evdev keys for the Mac's Control */
 } cfg;
+static char want_display[16];         /* config.json "display": which desktop (default: the lowest-numbered) */
 static const char *EDGE_NAMES[] = {"left", "right", "top", "bottom"};
 
 static void mod_keys(const char *v, int *l, int *r) {
@@ -20,6 +21,7 @@ static void load_config(void) {
         if (json_str(j, "speed", v, sizeof v) && atof(v) > 0.05 && atof(v) < 20) cfg.speed = atof(v);
         if (json_str(j, "mac_command", v, sizeof v)) snprintf(cmd, sizeof cmd, "%s", v);
         if (json_str(j, "mac_control", v, sizeof v)) snprintf(ctl, sizeof ctl, "%s", v);
+        if (json_str(j, "display", v, sizeof v) && v[0] == ':') snprintf(want_display, sizeof want_display, "%s", v);
     }
     mod_keys(cmd, &cfg.cmd_l, &cfg.cmd_r); mod_keys(ctl, &cfg.ctl_l, &cfg.ctl_r);
 }
