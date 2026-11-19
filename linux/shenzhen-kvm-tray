@@ -582,6 +582,8 @@ class App:
         col.pack_start(self.xfer_sep, False, False, 0)
         self.xfer_title = label("Clipboard transfers", bold=True)
         col.pack_start(self.xfer_title, False, False, 0)
+        self.xfer_note = label(secondary=True, small=True)
+        col.pack_start(self.xfer_note, False, False, 0)
         self.xfer_box = vbox(8)
         col.pack_start(self.xfer_box, False, False, 0)
 
@@ -798,6 +800,9 @@ class App:
     def refresh_transfers(self, xs, p, paste_waiting):
         show_if(self.xfer_sep, bool(xs))
         show_if(self.xfer_title, bool(xs))
+        incoming_files = any(t.get("dir") == "in" and t.get("what") not in ("text", "picture") for t in xs)
+        show_if(self.xfer_note, incoming_files)
+        set_text(self.xfer_note, "Received files wait in Downloads › From %s until you paste them, then they're removed. The 5 most recent you haven't pasted are kept." % p)
         show_if(self.xfer_box, bool(xs))
         ids = [t.get("id") for t in xs]
         if ids != [r for r in self.xfer_rows] or len(ids) != len(self.xfer_rows):
@@ -836,7 +841,13 @@ class App:
                 if now - t0 > 0.5 and done > d0:
                     d += " · %s/s" % size_text((done - d0) / (now - t0))
             elif state == "done":
-                d = "Done · %s" % size_text(total or done)
+                n = t.get("skipped") or 0
+                if n and not total:
+                    d = ("Already on %s" % p) if t.get("dir") == "out" else "Already here"
+                else:
+                    d = "Done · %s" % size_text(total or done)
+                    if n:
+                        d += (" · %d already on %s" % (n, p)) if t.get("dir") == "out" else (" · %d already here" % n)
             else:
                 d = "Failed: %s" % (t.get("reason") or "it stopped")
             if paste_waiting and t.get("dir") == "in" and active:

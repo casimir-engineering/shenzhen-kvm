@@ -14,11 +14,16 @@ static char peer_name[128] = "the other computer";   /* the peer's name (link, t
 static int here = 1;                  /* the pointer is on this computer (told by main) */
 static uid_t desk_uid; static gid_t desk_gid; static char desk_home[256] = "/root";   /* the desktop's user */
 static int xfer_seq, xfer_in = -1;    /* transfers shown in the tray app */
+static char held_dir[PATH_MAX];       /* the received copy whose files are on the clipboard */
+/* Pasted copies: removed once no other process has their files open for 10 s (PROTOCOL.md Kept copies). */
+#define MAXWATCH 8
+static struct { char dir[PATH_MAX]; int64_t requested, busy; } pw[MAXWATCH];
+static int xfer_skipped;                 /* files the receiving computer already had, for the next xfer() */
 static void xfer(int id, const char *dir, const char *what, uint64_t total, uint64_t done, const char *state, const char *reason) {
     char w[240]; snprintf(w, sizeof w, "%s", what); if (strlen(what) >= sizeof w) strcpy(w + sizeof w - 4, "...");
     buf_t b = {0}; bprintf(&b, "{\"id\": %d, \"dir\": \"%s\", \"what\": ", id, dir); json_put_str(&b, w);
     bprintf(&b, ", \"total\": %llu, \"done\": %llu, \"state\": \"%s\", \"reason\": ", (unsigned long long)total, (unsigned long long)done, state);
-    json_put_str(&b, reason ? reason : ""); bputs(&b, "}"); hsend(hfd, 'T', b.p, b.n); bfree(&b);
+    json_put_str(&b, reason ? reason : ""); bprintf(&b, ", \"skipped\": %d}", xfer_skipped); hsend(hfd, 'T', b.p, b.n); bfree(&b);
 }
 static pid_t push_pid;                /* background file push */
 /* XFixes, loaded at run time (the image has the library but not its headers) */
@@ -132,6 +137,12 @@ static void serve_request(XSelectionRequestEvent *r) {
                           .target = r->target, .property = None, .time = r->time};
     Atom prop = r->property ? r->property : r->target;
     const uint8_t *d = NULL; size_t n = 0;
+    if (r->selection == A_CLIP && held.own && held.kind == 3 && held_dir[0] && r->requestor != xwin && (r->target == A_URIS || r->target == A_GNOME)) {
+        int i, f = -1; int64_t now = mono_ms();   /* a paste of the received files */
+        for (i = 0; i < MAXWATCH; i++) if (pw[i].dir[0] && !strcmp(pw[i].dir, held_dir)) break;
+        if (i == MAXWATCH) { for (i = 0; i < MAXWATCH; i++) if (!pw[i].dir[0]) { f = i; break; } if (f >= 0) { i = f; snprintf(pw[i].dir, PATH_MAX, "%s", held_dir); pw[i].busy = 0; logmsg("received files asked for by another program (%s): removed once it has read them", strrchr(held_dir, '/') + 1); } }
+        if (i < MAXWATCH) pw[i].requested = now;
+    }
     if (r->selection == A_CLIP && held.own) {
         if (r->target == A_TARGETS) {
             Atom t[8]; int k = 0; t[k++] = A_TARGETS; t[k++] = A_TIMESTAMP;
@@ -333,6 +344,7 @@ static void pct_encode(buf_t *b, const char *s) {
 }
 static int own_files_list(const char *dir, char tops[][256], int ntops);
 static int tcp_frame_recv(int fd, buf_t *plain);
+static int tcp_frame_send(int fd, const uint8_t *m, size_t n);
 static int new_recv_dir(char *dir, size_t dn) {
     char stamp[64]; time_t t = time(NULL); struct tm tm; localtime_r(&t, &tm);
     strftime(stamp, sizeof stamp, "%Y-%m-%d %H.%M.%S", &tm);
@@ -349,92 +361,249 @@ static int safe_rel(const char *rel) {
     return 1;
 }
 static void clip_own_files(void);
-/* FILES_BEGIN header in hdr (after the type byte); FILES_DATA frames follow on fd. */
-static int files_receive_stream(int fd, const uint8_t *p, size_t n) {
+
+/* ---------- kept copies of received files (PROTOCOL.md Kept copies) ---------- */
+#define MARKER ".shenzhen-kvm.json"
+#define KEPT_COPIES 5
+static int dated_name(const char *n) {   /* "YYYY-MM-DD HH.MM.SS", optionally " 2" or " (2)" */
+    if (strlen(n) < 19) return 0;
+    for (int i = 0; i < 19; i++) {
+        char c = n[i];
+        if (i == 4 || i == 7) { if (c != '-') return 0; } else if (i == 10) { if (c != ' ') return 0; }
+        else if (i == 13 || i == 16) { if (c != '.') return 0; } else if (!isdigit((unsigned char)c)) return 0;
+    }
+    const char *r = n + 19; if (!*r) return 1;
+    if (*r++ != ' ') return 0;
+    int paren = *r == '('; if (paren) r++;
+    if (!isdigit((unsigned char)*r)) return 0; while (isdigit((unsigned char)*r)) r++;
+    if (paren && *r++ != ')') return 0;
+    return !*r;
+}
+static void recv_base(char *base, size_t n) { snprintf(base, n, "%s/Downloads/From %s", desk_home, peer_name); }
+static char *read_file_all(const char *path, size_t max) {
+    FILE *f = fopen(path, "r"); if (!f) return NULL;
+    buf_t b = {0}; char tmp[65536]; size_t k;
+    while ((k = fread(tmp, 1, sizeof tmp, f)) > 0 && b.n < max) bput(&b, tmp, k);
+    fclose(f); bz(&b); return (char *)b.p;
+}
+typedef struct { char path[PATH_MAX]; double created; } kept_t;
+static int kept_cmp(const void *a, const void *b) { double x = ((const kept_t *)a)->created, y = ((const kept_t *)b)->created; return x < y ? -1 : x > y; }
+/* The folders the service made under base (date-time name and our marker), oldest first. */
+static int kept_list(const char *base, kept_t **out) {
+    DIR *d = opendir(base); struct dirent *e; int n = 0, cap = 0; *out = NULL;
+    if (!d) return 0;
+    while ((e = readdir(d))) {
+        if (!dated_name(e->d_name)) continue;
+        char p[PATH_MAX], m[PATH_MAX + 32]; struct stat sb;
+        snprintf(p, sizeof p, "%s/%s", base, e->d_name);
+        if (lstat(p, &sb) || !S_ISDIR(sb.st_mode)) continue;
+        snprintf(m, sizeof m, "%s/%s", p, MARKER);
+        char *j = read_file_all(m, 1 << 16); if (!j) continue;
+        char by[32] = ""; json_str(j, "by", by, sizeof by); char cr[32] = ""; json_str(j, "created", cr, sizeof cr); free(j);
+        if (strcmp(by, "shenzhen-kvm")) continue;
+        if (n == cap) { cap = cap ? cap * 2 : 16; *out = realloc(*out, cap * sizeof **out); }
+        snprintf((*out)[n].path, PATH_MAX, "%s", p); (*out)[n].created = atof(cr); n++;
+    }
+    closedir(d);
+    if (n) qsort(*out, n, sizeof **out, kept_cmp);
+    return n;
+}
+static double mtime_of(const struct stat *sb) { return sb->st_mtim.tv_sec + sb->st_mtim.tv_nsec / 1e9; }
+/* A file the kept copies hold with this SHA-256 and size, unchanged since it arrived: its path in src. */
+static int held_file(const char *base, const char *shahex, uint64_t size, char *src, size_t sn) {
+    kept_t *k; int n = kept_list(base, &k), found = 0;
+    for (int i = n - 1; i >= 0 && !found; i--) {
+        char m[PATH_MAX + 32]; snprintf(m, sizeof m, "%s/%s", k[i].path, MARKER);
+        char *j = read_file_all(m, 64u << 20); if (!j) continue;
+        const char *p = json_find(j, "files"); char obj[2400];
+        while (p && !found && (p = json_next_obj(p, obj, sizeof obj))) {
+            char sh[80] = "", rel[1100] = "", sz[32] = "", mt[48] = "";
+            json_str(obj, "sha256", sh, sizeof sh); json_str(obj, "size", sz, sizeof sz);
+            if (strcmp(sh, shahex) || strtoull(sz, NULL, 10) != size) continue;
+            json_str(obj, "path", rel, sizeof rel); json_str(obj, "mtime", mt, sizeof mt);
+            if (!safe_rel(rel)) continue;
+            char full[PATH_MAX]; struct stat sb; snprintf(full, sizeof full, "%s/%s", k[i].path, rel);
+            if (lstat(full, &sb) || !S_ISREG(sb.st_mode) || (uint64_t)sb.st_size != size || (mtime_of(&sb) - atof(mt) > 0.001 || atof(mt) - mtime_of(&sb) > 0.001)) continue;
+            snprintf(src, sn, "%s", full); found = 1;
+        }
+        free(j);
+    }
+    free(k); return found;
+}
+/* Marks dir as ours and records what it holds. */
+static void write_marker(const char *dir, char (*rel)[1024], const uint64_t *sz, uint8_t (*sha)[32], unsigned cnt) {
+    buf_t b = {0}; bprintf(&b, "{\"by\": \"shenzhen-kvm\", \"v\": 1, \"created\": %.6f, \"files\": [", now_us() / 1e6);
+    for (unsigned i = 0; i < cnt; i++) {
+        char full[PATH_MAX], hx[65]; struct stat sb; snprintf(full, sizeof full, "%s/%s", dir, rel[i]);
+        double mt = lstat(full, &sb) == 0 ? mtime_of(&sb) : 0; tohex(sha[i], 32, hx);
+        bputs(&b, i ? ", {\"path\": " : "{\"path\": "); json_put_str(&b, rel[i]);
+        bprintf(&b, ", \"size\": %llu, \"sha256\": \"%s\", \"mtime\": %.9f}", (unsigned long long)sz[i], hx, mt);
+    }
+    bputs(&b, "]}\n");
+    char m[PATH_MAX + 32]; snprintf(m, sizeof m, "%s/%s", dir, MARKER);
+    int f = open(m, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0644);
+    if (f >= 0) { write_all(f, b.p, b.n); fchown(f, desk_uid, desk_gid); close(f); }
+    bfree(&b);
+}
+static int rm_cb(const char *p, const struct stat *sb, int t, struct FTW *f) { (void)sb; (void)t; (void)f; return remove(p) ? 0 : 0; }
+static int path_in(const char *list, const char *dir) {   /* a path in list (or its %-encoded form) is inside dir */
+    if (!list) return 0;
+    char pre[PATH_MAX + 2]; snprintf(pre, sizeof pre, "%s/", dir);
+    if (strstr(list, pre)) return 1;
+    buf_t enc = {0}; pct_encode(&enc, pre); bz(&enc); int hit = strstr(list, (char *)enc.p) != NULL; bfree(&enc);
+    return hit;
+}
+/* Keeps the newest kept copies; never one whose files are on the clipboard or the one just made.
+   Removes base when it ends up empty. */
+static void roll_kept(const char *keep_dir) {
+    char base[PATH_MAX]; recv_base(base, sizeof base);
+    kept_t *k; int n = kept_list(base, &k), excess = n - KEPT_COPIES;
+    char *other = NULL;   /* files another program put on the clipboard (a file manager) */
+    if (excess > 0 && dpy) {
+        Window o = XGetSelectionOwner(dpy, A_CLIP);
+        if (o != None && o != xwin) { buf_t d = {0}; Atom ty; if (x_convert(A_URIS, &d, &ty)) { bz(&d); other = (char *)d.p; } else bfree(&d); }
+    }
+    buf_t mine = {0}; if (held.own) { bput(&mine, held.uris.p, held.uris.n); bput(&mine, "\n", 1); bput(&mine, held.data.p, held.data.n); } bz(&mine);
+    for (int i = 0; i < n && excess > 0; i++) {
+        if (!strcmp(k[i].path, keep_dir) || path_in((char *)mine.p, k[i].path) || path_in(other, k[i].path)) continue;
+        struct stat sb; if (lstat(k[i].path, &sb) || !S_ISDIR(sb.st_mode)) continue;
+        nftw(k[i].path, rm_cb, 16, FTW_DEPTH | FTW_PHYS);
+        logmsg("removed an older copy of received files (%s)", strrchr(k[i].path, '/') + 1);
+        excess--;
+    }
+    rmdir(base);   /* only when empty */
+    free(k); free(other); bfree(&mine);
+}
+/* The kept copy into the new folder: a reflink when the file system has them, else a plain copy. */
+static int copy_file(const char *src, const char *dst) {
+    int in = open(src, O_RDONLY | O_NOFOLLOW | O_CLOEXEC); if (in < 0) return -1;
+    int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0644); if (out < 0) { close(in); return -1; }
+    int ok = ioctl(out, FICLONE, in) == 0;
+    if (!ok) { char b[65536]; ssize_t r; ok = 1; while ((r = read(in, b, sizeof b)) > 0) if (write_all(out, b, r)) { ok = 0; break; } if (r < 0) ok = 0; }
+    fchown(out, desk_uid, desk_gid); close(in); close(out); return ok ? 0 : -1;
+}
+static int sha256_file(const char *path, uint8_t out[32]) {
+    int f = open(path, O_RDONLY | O_CLOEXEC); if (f < 0) return -1;
+    crypto_hash_sha256_state h; crypto_hash_sha256_init(&h); static uint8_t b[1 << 20]; ssize_t r;
+    while ((r = read(f, b, sizeof b)) > 0) crypto_hash_sha256_update(&h, b, r);
+    close(f); crypto_hash_sha256_final(&h, out); return r < 0 ? -1 : 0;
+}
+
+/* FILES_OFFER (offer) or FILES_BEGIN header in p (after the type byte); FILES_DATA frames follow on fd. */
+static int files_receive_stream(int fd, const uint8_t *p, size_t n, int offer) {
     if (n < 2) return 0;
     unsigned cnt = get16(p); size_t off = 2;
     char (*rel)[1024] = calloc(cnt ? cnt : 1, 1024); uint64_t *sz = calloc(cnt ? cnt : 1, 8); uint64_t total = 0;
+    uint8_t (*want)[32] = calloc(cnt ? cnt : 1, 32), (*sha)[32] = calloc(cnt ? cnt : 1, 32); char **from = calloc(cnt ? cnt : 1, sizeof(char *));
+    unsigned nheld = 0; char dir[PATH_MAX] = ""; buf_t fr = {0};
     for (unsigned i = 0; i < cnt; i++) {
         if (off + 2 > n) goto fail;
         unsigned nl = get16(p + off); off += 2;
-        if (nl == 0 || nl >= 1024 || off + nl + 8 > n) goto fail;
-        memcpy(rel[i], p + off, nl); rel[i][nl] = 0; off += nl; sz[i] = get64(p + off); off += 8; total += sz[i];
+        if (nl == 0 || nl >= 1024 || off + nl + 8 + (offer ? 32 : 0) > n) goto fail;
+        memcpy(rel[i], p + off, nl); rel[i][nl] = 0; off += nl; sz[i] = get64(p + off); off += 8;
+        if (offer) { memcpy(want[i], p + off, 32); off += 32; }
         if (!safe_rel(rel[i])) { herr("refused file name %s", rel[i]); goto fail; }
     }
-    char dir[PATH_MAX]; if (new_recv_dir(dir, sizeof dir)) { herr("cannot create %s", dir); goto fail; }
-    char tops[64][256]; int ntops = 0; buf_t fr = {0}; size_t fo = 0; uint64_t got = 0; int64_t shown = 0;
+    char base[PATH_MAX]; recv_base(base, sizeof base);
+    if (offer) {   /* what the kept copies already hold is not sent again */
+        buf_t have = {0}; uint8_t t = 0x2B, b2[2]; bput(&have, &t, 1); put16(b2, 0); bput(&have, b2, 2);
+        for (unsigned i = 0; i < cnt; i++) {
+            char hx[65], src[PATH_MAX]; tohex(want[i], 32, hx);
+            if (held_file(base, hx, sz[i], src, sizeof src)) { from[i] = strdup(src); put16(b2, i); bput(&have, b2, 2); nheld++; }
+        }
+        put16(have.p + 1, nheld);
+        int bad = tcp_frame_send(fd, have.p, have.n); bfree(&have);
+        if (bad) goto fail;
+    }
+    for (unsigned i = 0; i < cnt; i++) if (!from[i]) total += sz[i];
+    if (new_recv_dir(dir, sizeof dir)) { herr("cannot create %s", dir); dir[0] = 0; goto fail; }
+    char tops[64][256]; int ntops = 0; size_t fo = 0; uint64_t got = 0; int64_t shown = 0;
     if (xfer_in < 0) xfer_in = ++xfer_seq;
     char what[300]; snprintf(what, sizeof what, "%.*s", (int)strcspn(cnt ? rel[0] : "files", "/"), cnt ? rel[0] : "files");
     if (cnt > 1) { int tops_n = 0; for (unsigned i = 0; i < cnt; i++) if (!i || strncmp(rel[i], rel[0], strcspn(rel[0], "/") + 1)) tops_n++; if (tops_n > 1) snprintf(what, sizeof what, "%u files", cnt); }
-    xfer(xfer_in, "in", what, total, 0, "running", NULL);
+    xfer_skipped = nheld; xfer(xfer_in, "in", what, total, 0, "running", NULL);
     for (unsigned i = 0; i < cnt; i++) {
         char full[PATH_MAX]; snprintf(full, sizeof full, "%s/%s", dir, rel[i]);
         for (char *s2 = full + strlen(dir) + 1; (s2 = strchr(s2, '/')); s2++) { *s2 = 0; mkdir_owned(full); *s2 = '/'; }
-        int f = open(full, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0644);
-        if (f < 0) { herr("cannot write %s", full); bfree(&fr); goto fail; }
-        uint64_t left = sz[i];
-        while (left) {
-            if (fo >= fr.n) {
-                if (tcp_frame_recv(fd, &fr) || fr.n < 1 || fr.p[0] != 0x28) { close(f); bfree(&fr); herr("%s stopped sending files", peer_name); goto fail; }
-                fo = 1; got += fr.n - 1;
-                if (mono_ms() - shown > 250) { shown = mono_ms(); xfer(xfer_in, "in", what, total, got, "running", NULL); }
+        if (from[i]) {
+            if (copy_file(from[i], full)) { herr("cannot copy %s", rel[i]); goto fail; }
+            memcpy(sha[i], want[i], 32);
+        } else {
+            int f = open(full, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0644);
+            if (f < 0) { herr("cannot write %s", full); goto fail; }
+            crypto_hash_sha256_state h; crypto_hash_sha256_init(&h);
+            uint64_t left = sz[i];
+            while (left) {
+                if (fo >= fr.n) {
+                    if (tcp_frame_recv(fd, &fr) || fr.n < 1 || fr.p[0] != 0x28) { close(f); herr("%s stopped sending files", peer_name); goto fail; }
+                    fo = 1; got += fr.n - 1;
+                    if (mono_ms() - shown > 250) { shown = mono_ms(); xfer(xfer_in, "in", what, total, got, "running", NULL); }
+                }
+                size_t k = fr.n - fo < left ? fr.n - fo : left;
+                write_all(f, fr.p + fo, k); crypto_hash_sha256_update(&h, fr.p + fo, k); fo += k; left -= k;
             }
-            size_t k = fr.n - fo < left ? fr.n - fo : left;
-            write_all(f, fr.p + fo, k); fo += k; left -= k;
+            fchown(f, desk_uid, desk_gid); close(f);
+            crypto_hash_sha256_final(&h, sha[i]);
+            if (offer && memcmp(sha[i], want[i], 32)) { logmsg("refused %s: its content does not match what was announced", rel[i]); herr("%s arrived damaged and was not kept", rel[i]); goto fail; }
         }
-        fchown(f, desk_uid, desk_gid); close(f);
         char top[256]; snprintf(top, sizeof top, "%.*s", (int)strcspn(rel[i], "/"), rel[i]);
         int seen = 0; for (int k2 = 0; k2 < ntops; k2++) if (!strcmp(tops[k2], top)) seen = 1;
         if (!seen && ntops < 64) strcpy(tops[ntops++], top);
     }
-    bfree(&fr); free(rel); free(sz);
-    if (!own_files_list(dir, tops, ntops)) return 0;
+    write_marker(dir, rel, sz, sha, cnt);
+    bfree(&fr);
+    if (!own_files_list(dir, tops, ntops)) goto fail_kept;
     clip_own_files();
-    xfer(xfer_in, "in", what, total, total, "done", NULL); xfer_in = -1;
-    logmsg("%u file(s) from %s in %s (%llu bytes)", cnt, peer_name, dir, (unsigned long long)total);
+    xfer(xfer_in, "in", what, total, total, "done", NULL); xfer_in = -1; xfer_skipped = 0;
+    logmsg("%u file(s) from %s in %s (%llu bytes received, %u already here)", cnt, peer_name, dir, (unsigned long long)total, nheld);
+    roll_kept(dir);
+    for (unsigned i = 0; i < cnt; i++) free(from[i]);
+    free(rel); free(sz); free(want); free(sha); free(from);
     return 1;
 fail:
+    if (dir[0]) { nftw(dir, rm_cb, 16, FTW_DEPTH | FTW_PHYS); }
+fail_kept:
     if (xfer_in >= 0) { xfer(xfer_in, "in", "files", total, 0, "failed", "the transfer stopped before the end"); xfer_in = -1; }
-    free(rel); free(sz); return 0;
+    xfer_skipped = 0; bfree(&fr);
+    for (unsigned i = 0; i < cnt; i++) free(from[i]);
+    free(rel); free(sz); free(want); free(sha); free(from); return 0;
 }
 
-static int files_receive(const uint8_t *p, size_t n) {
-    char dir[PATH_MAX], stamp[64]; time_t t = time(NULL); struct tm tm; localtime_r(&t, &tm);
-    strftime(stamp, sizeof stamp, "%Y-%m-%d %H.%M.%S", &tm);
-    char base[600], dl[300]; snprintf(dl, sizeof dl, "%s/Downloads", desk_home); snprintf(base, sizeof base, "%s/From %s", dl, peer_name);
-    mkdir_owned(dl); mkdir_owned(base);
-    snprintf(dir, sizeof dir, "%s/%s", base, stamp);
-    for (int i = 2; access(dir, F_OK) == 0; i++) snprintf(dir, sizeof dir, "%s/%s (%d)", base, stamp, i);
-    if (mkdir_owned(dir)) { herr("cannot create %s", dir); return 0; }
+static int files_receive(const uint8_t *p, size_t n) {   /* files in one piece (CLIP_DATA kind 3) */
+    char dir[PATH_MAX];
     if (n < 2) return 0;
+    if (new_recv_dir(dir, sizeof dir)) { herr("cannot create %s", dir); return 0; }
     unsigned cnt = get16(p); size_t off = 2;
+    char (*rel)[1024] = calloc(cnt ? cnt : 1, 1024); uint64_t *szs = calloc(cnt ? cnt : 1, 8); uint8_t (*sha)[32] = calloc(cnt ? cnt : 1, 32); unsigned made = 0;
     char tops[64][256]; int ntops = 0;
     for (unsigned i = 0; i < cnt; i++) {
-        if (off + 2 > n) return 0;
+        if (off + 2 > n) break;
         unsigned nl = get16(p + off); off += 2;
-        if (off + nl + 8 > n || nl == 0 || nl >= 1024) return 0;
-        char rel[1024]; memcpy(rel, p + off, nl); rel[nl] = 0; off += nl;
+        if (off + nl + 8 > n || nl == 0 || nl >= 1024) break;
+        char r1[1024]; memcpy(r1, p + off, nl); r1[nl] = 0; off += nl;
         uint64_t sz = get64(p + off); off += 8;
-        if (sz > n - off) return 0;
+        if (sz > n - off) break;
         const uint8_t *data = p + off; off += sz;
-        /* refuse absolute paths and .. ; empty components */
-        if (rel[0] == '/' || strchr(rel, '\\')) { herr("refused file name %s", rel); continue; }
-        int bad = 0; char tmp[1024]; strcpy(tmp, rel);
-        for (char *c = strtok(tmp, "/"); c; c = strtok(NULL, "/")) if (!strcmp(c, "..") || !strcmp(c, ".")) bad = 1;
-        if (bad || strstr(rel, "//")) { herr("refused file name %s", rel); continue; }
-        char full[PATH_MAX]; snprintf(full, sizeof full, "%s/%s", dir, rel);
+        if (!safe_rel(r1)) { herr("refused file name %s", r1); continue; }
+        char full[PATH_MAX]; snprintf(full, sizeof full, "%s/%s", dir, r1);
         for (char *s = full + strlen(dir) + 1; (s = strchr(s, '/')); s++) { *s = 0; mkdir_owned(full); *s = '/'; }
-        int fd = open(full, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0644);
+        int fd = open(full, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0644);
         if (fd < 0) { herr("cannot write %s", full); continue; }
         write_all(fd, data, sz); fchown(fd, desk_uid, desk_gid); close(fd);
-        char top[256]; snprintf(top, sizeof top, "%.*s", (int)strcspn(rel, "/"), rel);
+        snprintf(rel[made], 1024, "%s", r1); szs[made] = sz; crypto_hash_sha256(sha[made], data, sz); made++;
+        char top[256]; snprintf(top, sizeof top, "%.*s", (int)strcspn(r1, "/"), r1);
         int seen = 0; for (int k = 0; k < ntops; k++) if (!strcmp(tops[k], top)) seen = 1;
         if (!seen && ntops < 64) strcpy(tops[ntops++], top);
     }
-    return own_files_list(dir, tops, ntops);
+    write_marker(dir, rel, szs, sha, made);
+    free(rel); free(szs); free(sha);
+    int ok = own_files_list(dir, tops, ntops);
+    if (ok) roll_kept(dir);
+    return ok;
 }
 static int own_files_list(const char *dir, char tops[][256], int ntops) {
     if (!ntops) { rmdir(dir); return 0; }
+    snprintf(held_dir, sizeof held_dir, "%s", dir);
     held.uris.n = held.gnome.n = held.data.n = 0;
     bput(&held.gnome, "copy", 4);
     for (int k = 0; k < ntops; k++) {
@@ -490,15 +659,15 @@ static int tcp_frame_send(int fd, const uint8_t *m, size_t n);
 static int tcp_frame_recv(int fd, buf_t *plain);
 /* Send the collected files to the peer in pieces. Returns 0 when it has saved them. */
 static int out_id; static char out_what[300]; static uint64_t out_total;
-static int send_files_stream(void) {
-    int fd = tcp_connect_peer(1500); if (fd < 0) return -1;
-    uint64_t sent = 0; int64_t shown = 0;
-    buf_t h = {0}; uint8_t t = 0x27, b[10]; bput(&h, &t, 1); put16(b, nfents); bput(&h, b, 2);
-    for (int i = 0; i < nfents; i++) { size_t l = strlen(fents[i].rel); put16(b, l); bput(&h, b, 2); bput(&h, fents[i].rel, l); put64(b, fents[i].size); bput(&h, b, 8); }
-    int bad = tcp_frame_send(fd, h.p, h.n); bfree(&h);
+/* The FILES_DATA frames of the files not in skip, then the ACK. */
+static int send_data(int fd, const char *skip) {
+    uint64_t sent = 0, total = 0; int64_t shown = 0; int bad = 0;
+    for (int i = 0; i < nfents; i++) if (!skip || !skip[i]) total += fents[i].size;
+    out_total = total;
     static uint8_t chunk[1 + (1 << 20)]; chunk[0] = 0x28;
     for (int i = 0; i < nfents && !bad; i++) {
-        int f = open(fents[i].full, O_RDONLY); uint64_t left = fents[i].size;
+        if (skip && skip[i]) continue;
+        int f = open(fents[i].full, O_RDONLY | O_CLOEXEC); uint64_t left = fents[i].size;
         while (left && !bad) {
             size_t want = left < (1u << 20) ? left : (1u << 20); ssize_t r = f >= 0 ? read(f, chunk + 1, want) : 0;
             if (r <= 0) { memset(chunk + 1, 0, want); r = want; }   /* file shrank: keep the promised size */
@@ -508,7 +677,33 @@ static int send_files_stream(void) {
         if (f >= 0) close(f);
     }
     buf_t rep = {0}; if (!bad) bad = tcp_frame_recv(fd, &rep) || rep.n < 1 || rep.p[0] != 0x02;
-    bfree(&rep); close(fd); return bad ? -1 : 0;
+    bfree(&rep); return bad ? -1 : 0;
+}
+/* Send the collected files to the peer (PROTOCOL.md FILES_OFFER; FILES_BEGIN with everything when it
+   is an older version). Returns 0 when it has saved them. */
+static int send_files_stream(void) {
+    uint8_t (*sha)[32] = calloc(nfents ? nfents : 1, 32); char *skip = calloc(nfents ? nfents : 1, 1); int r = -1;
+    for (int i = 0; i < nfents; i++) if (sha256_file(fents[i].full, sha[i])) { free(sha); free(skip); return -1; }
+    int fd = tcp_connect_peer(1500); if (fd < 0) { free(sha); free(skip); return -1; }
+    int offered = 0;
+    if (!getenv("SHENZHEN_KVM_NO_OFFER")) {
+        buf_t h = {0}; uint8_t t = 0x2A, b[10]; bput(&h, &t, 1); put16(b, nfents); bput(&h, b, 2);
+        for (int i = 0; i < nfents; i++) { size_t l = strlen(fents[i].rel); put16(b, l); bput(&h, b, 2); bput(&h, fents[i].rel, l); put64(b, fents[i].size); bput(&h, b, 8); bput(&h, sha[i], 32); }
+        buf_t rep = {0};
+        if (!tcp_frame_send(fd, h.p, h.n) && !tcp_frame_recv(fd, &rep) && rep.n >= 3 && rep.p[0] == 0x2B) {
+            unsigned k = get16(rep.p + 1); offered = 1;
+            for (unsigned i = 0; i < k && 3 + 2 * i + 1 < rep.n; i++) { unsigned x = get16(rep.p + 3 + 2 * i); if (x < (unsigned)nfents) { skip[x] = 1; xfer_skipped++; } }
+        }
+        bfree(&h); bfree(&rep);
+        if (!offered) { close(fd); fd = tcp_connect_peer(1500); if (fd < 0) { free(sha); free(skip); return -1; } }   /* an older version */
+    }
+    if (offered) r = send_data(fd, skip);
+    else {
+        buf_t h = {0}; uint8_t t = 0x27, b[10]; bput(&h, &t, 1); put16(b, nfents); bput(&h, b, 2);
+        for (int i = 0; i < nfents; i++) { size_t l = strlen(fents[i].rel); put16(b, l); bput(&h, b, 2); bput(&h, fents[i].rel, l); put64(b, fents[i].size); bput(&h, b, 8); }
+        r = tcp_frame_send(fd, h.p, h.n) ? -1 : send_data(fd, NULL); bfree(&h);
+    }
+    close(fd); free(sha); free(skip); return r;
 }
 
 static int peer_request(const uint8_t *m, size_t n, buf_t *rep);
@@ -551,7 +746,7 @@ static void clip_push(void) {
                     int ok = nfents > 0 && send_files_stream() == 0;
                     if (!ok) send_u64s(0x24, 0, 0, 0);
                     char why[200]; snprintf(why, sizeof why, "%s did not take the files", peer_name);
-                    xfer(id, "out", what, total, ok ? total : 0, ok ? "done" : "failed", ok ? NULL : why);
+                    xfer(id, "out", what, ok ? out_total : total, ok ? out_total : 0, ok ? "done" : "failed", ok ? NULL : why);
                     logmsg("files sent to %s: %s", peer_name, ok ? "done" : "failed");
                     _exit(0);
                 }
@@ -662,9 +857,9 @@ static void tcp_serve(int lfd) {
             }
             if (in.n > 1 && in.p[1] == 3) { uint8_t w = 0; hsend(hfd, 'W', &w, 1); }
         }
-        else if (t == 0x27) {
-            int ok = dpy && st.sharing && st.clipboard && files_receive_stream(fd, in.p + 1, in.n - 1);
-            if (ok) { uint8_t a[2] = {0x02, 0x27}; tcp_frame_send(fd, a, 2); }
+        else if (t == 0x27 || (t == 0x2A && !getenv("SHENZHEN_KVM_NO_OFFER"))) {
+            int ok = dpy && st.sharing && st.clipboard && files_receive_stream(fd, in.p + 1, in.n - 1, t == 0x2A);
+            if (ok) { uint8_t a[2] = {0x02, t}; tcp_frame_send(fd, a, 2); }
             uint8_t w = 0; hsend(hfd, 'W', &w, 1);
         }
         else if (t == 0x24 && in.n >= 9) {
@@ -771,6 +966,46 @@ static void helper_cmd(uint8_t t, buf_t *b) {
     }
 }
 
+/* Another process (not this service) has a file inside dir open. */
+static int dir_in_use(const char *dir) {
+    char pre[PATH_MAX + 2]; snprintf(pre, sizeof pre, "%s/", dir); size_t pl = strlen(pre);
+    DIR *d = opendir("/proc"); struct dirent *e; int busy = 0;
+    if (!d) return 0;
+    while (!busy && (e = readdir(d))) {
+        if (!isdigit((unsigned char)e->d_name[0])) continue;
+        char p[64], comm[32] = ""; snprintf(p, sizeof p, "/proc/%s/comm", e->d_name);
+        if (read_small(p, comm, sizeof comm) > 0 && !strncmp(comm, "shenzhen-kvm", 12)) continue;
+        snprintf(p, sizeof p, "/proc/%s/fd", e->d_name);
+        DIR *fdd = opendir(p); struct dirent *f; if (!fdd) continue;
+        while (!busy && (f = readdir(fdd))) {
+            char l[PATH_MAX + 64], t[PATH_MAX]; snprintf(l, sizeof l, "%s/%s", p, f->d_name);
+            ssize_t n = readlink(l, t, sizeof t - 1); if (n <= 0) continue; t[n] = 0;
+            if (!strncmp(t, pre, pl)) busy = 1;
+        }
+        closedir(fdd);
+    }
+    closedir(d); return busy;
+}
+static int paste_watch_tick(void) {   /* returns 1 while something is watched */
+    int64_t now = mono_ms(); int any = 0;
+    for (int i = 0; i < MAXWATCH; i++) {
+        if (!pw[i].dir[0]) continue;
+        struct stat sb; if (lstat(pw[i].dir, &sb) || !S_ISDIR(sb.st_mode)) { pw[i].dir[0] = 0; continue; }
+        any = 1;
+        if (dir_in_use(pw[i].dir)) { pw[i].busy = now; continue; }
+        int64_t last = pw[i].busy > pw[i].requested ? pw[i].busy : pw[i].requested;
+        if (now - last < 10000) continue;
+        nftw(pw[i].dir, rm_cb, 16, FTW_DEPTH | FTW_PHYS);
+        logmsg("removed pasted files (%s)", strrchr(pw[i].dir, '/') + 1);
+        if (held.own && !strcmp(held_dir, pw[i].dir) && dpy) {   /* the clipboard would offer files that are gone */
+            XSetSelectionOwner(dpy, A_CLIP, None, CurrentTime); XFlush(dpy); held.own = 0; held_dir[0] = 0;
+        }
+        char base[PATH_MAX]; snprintf(base, sizeof base, "%s", pw[i].dir); char *sl = strrchr(base, '/'); if (sl) { *sl = 0; rmdir(base); }
+        pw[i].dir[0] = 0;
+    }
+    return any;
+}
+
 static void helper_main(int fd) {
     hfd = fd; who_am_i = "helper";
     signal(SIGPIPE, SIG_IGN);
@@ -785,7 +1020,9 @@ static void helper_main(int fd) {
         if (!dpy && mono_ms() >= next_try) { if (!x_connect()) next_try = mono_ms() + 2000; }
         struct pollfd q[3] = {{hfd, POLLIN, 0}, {lfd, POLLIN, 0}, {dpy ? ConnectionNumber(dpy) : -1, POLLIN, 0}};
         if (dpy) while (XPending(dpy)) { XEvent e; XNextEvent(dpy, &e); handle_xevent(&e); }
-        if (poll(q, 3, dpy ? 5000 : 2000) < 0 && errno != EINTR) _exit(5);
+        int watching = 0; for (int i = 0; i < MAXWATCH; i++) if (pw[i].dir[0]) watching = 1;
+        if (poll(q, 3, watching ? 1000 : dpy ? 5000 : 2000) < 0 && errno != EINTR) _exit(5);
+        if (watching) paste_watch_tick();
         if (push_pid > 0 && waitpid(push_pid, NULL, WNOHANG) == push_pid) push_pid = 0;
         if (q[0].revents) { uint8_t t; if (hrecv(hfd, &t, &b)) _exit(0); helper_cmd(t, &b); }
         if (q[1].revents & POLLIN) tcp_serve(lfd);

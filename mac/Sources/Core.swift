@@ -841,6 +841,7 @@ final class Core {
 
     private func handleTCP(_ req: [UInt8], _ fd: Int32) -> [UInt8]? {
         guard let t = req.first else { return nil }
+        let t0 = t
         var pa = sockaddr_in(); var pl = socklen_t(MemoryLayout<sockaddr_in>.size)
         if withUnsafeMutablePointer(to: &pa, { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getpeername(fd, $0, &pl) } }) == 0, Int32(pa.sin_family) == AF_INET {
             heard(ip: ipString(pa.sin_addr), by: nil)
@@ -861,19 +862,21 @@ final class Core {
             transfers.finish(t, ok: ok, reason: ok ? "" : "it could not be put on the clipboard")
             if req[1] == 3 { filesArrived() }
             return [0x02, 0x22]
-        case 0x27:
+        case 0x27, 0x2A:
+            if t0 == 0x2A && ProcessInfo.processInfo.environment["SHENZHEN_KVM_NO_OFFER"] == "1" { return nil }   // tests: an older version
             guard let box = locked({ box }), locked({ cfg.clipboard && !cfg.paused }) else { return nil }
             let t = transfers.incoming() ?? transfers.add(Transfer(toPeer: false, what: "files", total: 0))
             transfers.update(t, { $0.state = .running }, force: true)
-            let res = receiveFiles(fd: fd, box: box, header: req) { names, got, total in
-                self.transfers.update(t, { $0.what = filesSummary(names); $0.total = total; $0.done = got })
+            let res = receiveFiles(fd: fd, box: box, header: req, offer: t0 == 0x2A) { names, got, total, skipped in
+                self.transfers.update(t, { $0.what = filesSummary(names); $0.total = total; $0.done = got; $0.skipped = skipped })
             }
             switch res {
-            case .success(let urls):
-                onMain { NSPasteboard.general.clearContents(); NSPasteboard.general.writeObjects(urls as [NSURL]); markOwnChange() }
+            case .success(let rf):
+                onMain { PasteWatch.shared.put(rf.items, folder: rf.folder, on: NSPasteboard.general); markOwnChange() }
                 transfers.finish(t, ok: true)
                 filesArrived()
-                return [0x02, 0x27]
+                rollKeptCopies(receivedFilesRoot(), protect: pasteboardFiles() + [rf.folder])
+                return [0x02, t0]
             case .failure(let e):
                 transfers.finish(t, ok: false, reason: "\(e)")
                 locked { pendingFiles = false; pasteDeferred = false }
@@ -938,7 +941,13 @@ final class Core {
         if let r = r, r.first == 0x20, let j = try? JSONSerialization.jsonObject(with: Data(r.dropFirst())) as? [String: Any] {
             name = j["name"] as? String ?? ""; os = j["os"] as? String ?? "linux"
         }
-        let online = r?.first == 0x20
+        // One missed answer is not "gone": it takes 3 in a row (about 9 s), or no address at all.
+        let answered = r?.first == 0x20
+        let online = locked { () -> Bool in
+            if answered { helloMisses = 0; return true }
+            helloMisses += 1
+            return peerOnline && helloMisses < 3 && peerIP != nil
+        }
         let changed = locked { () -> Bool in
             let c = peerOnline != online || (!name.isEmpty && name != peerName); peerOnline = online
             if !name.isEmpty { peerName = name; peerOS = os; setOtherName(name) }; return c
@@ -1014,6 +1023,7 @@ final class Core {
         DispatchQueue.global().async { self.sendSettings() }
     }
     private var lastSettingsSent = -100.0
+    private var helloMisses = 0
     func sendSettings() {
         let body = locked { cfg.wireJSON }
         if let r = request([0x26] + body), r.first == 0x02 { locked { lastSettingsSent = mono() } }
@@ -1056,7 +1066,8 @@ final class Core {
         guard cc != lastChangeCount else { return }
         lastChangeCount = cc
         if cc == ownChangeCount { return }
-        let (on, here, big, limit) = locked { (cfg.clipboard && cfg.usualShortcuts && !cfg.paused && peerOnline && link != nil, mode != .driving, cfg.bigFiles, UInt64(cfg.fileLimitMB) << 20) }
+        // Sent whenever the other computer's address is known; a failure shows in the window.
+        let (on, here, big, limit) = locked { (cfg.clipboard && cfg.usualShortcuts && !cfg.paused && peerIP != nil && link != nil, mode != .driving, cfg.bigFiles, UInt64(cfg.fileLimitMB) << 20) }
         guard on, here else { return }
         let pb = NSPasteboard.general
         if let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty {
@@ -1072,9 +1083,10 @@ final class Core {
                 var p: [UInt8] = [0x24]; p.u64(total); _ = self.request(p)
                 let (h, port, bx) = self.locked { (self.peerIP ?? "", (self.peerDP ?? 24800) + 1, self.box) }
                 var why: String? = "\(otherComputer()) did not answer"
-                if let box = bx, let fd = tcpConnect(host: h, port: port) {
-                    why = sendFiles(fd: fd, box: box, files: files) { sent in self.transfers.update(t, { $0.done = sent }) }
-                    close(fd)
+                if let box = bx {
+                    why = sendFiles(connect: { tcpConnect(host: h, port: port) }, box: box, files: files,
+                                    progress: { sent, toSend in self.transfers.update(t, { $0.done = sent; $0.total = toSend }) },
+                                    skipped: { n in self.transfers.update(t, { $0.skipped = n }, force: true) })
                 }
                 if let w = why { var c: [UInt8] = [0x24]; c.u64(0); _ = self.request(c); self.transfers.finish(t, ok: false, reason: w) }
                 else { self.transfers.finish(t, ok: true) }

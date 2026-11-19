@@ -203,13 +203,32 @@ Plaintext = u8 type + body.
 | 0x27 | FILES_BEGIN | Files in pieces (every file transfer). u16 count, then per file: u16 name length, UTF-8 relative path, u64 size. It is the first frame on its connection; FILES_DATA frames follow on the same connection, then the receiver writes the files, puts them on its clipboard and replies ACK (0x02 0x27); it closes the connection without an ACK if it fails |
 | 0x28 | FILES_DATA | raw bytes, at most 1 MiB per frame: the files' contents back to back, in the order of FILES_BEGIN. Each frame is sealed on its own; both sides measure progress from these frames |
 | 0x29 | FORGET | none. "The person forgot this link here": the receiver forgets it too. Reply: ACK |
+| 0x2A | FILES_OFFER | Files in pieces, without what the receiver already has (used for every file transfer; FILES_BEGIN is the fallback). u16 count, then per file: u16 name length, UTF-8 relative path, u64 size, u8[32] SHA-256 of its content. It is the first frame on its connection. The receiver answers FILES_HAVE, then FILES_DATA frames follow on the same connection with the contents of the files it does not have only, in order; the receiver checks the SHA-256 of every file it received, builds the new folder, puts it on its clipboard and replies ACK (0x02 0x2A), or closes the connection without an ACK if anything fails (a hash that does not match included). A receiver that does not know FILES_OFFER closes the connection without an answer; the sender then sends everything with FILES_BEGIN on a new connection |
+| 0x2B | FILES_HAVE | u16 n, then n × u16: the indexes (in FILES_OFFER's order) of the files the receiver already holds in its kept copies (same SHA-256 and size, unchanged since it received them); they are not sent |
 
 Any authentic request on this channel also updates the peer's address (its source address).
 
 Received files are written to a fresh folder (`~/Downloads/From <other computer's name>/<date time>/`,
 on Linux in the home of the user who owns the desktop) and the local clipboard is set to those files
 (file URLs on the Mac; `text/uri-list` and `x-special/gnome-copied-files` on Linux). Path components
-`..` and absolute paths are refused.
+`..` and absolute paths are refused. Files the receiver already held are copied into the new folder
+from its kept copy (an APFS clone on the Mac, a reflink on Linux when the file system has them, else a
+plain copy), so each folder stands on its own.
+
+**Kept copies.** Each received folder carries a hidden `.shenzhen-kvm.json` (by, created, and per file
+its path, size, SHA-256 and modification time), which marks it as one the service made and lists what
+it holds. In each `From <name>` folder the receiver keeps the 5 newest such folders: when a sixth is
+complete, the oldest go, except a folder whose files are on the clipboard now or are being received.
+Only folders whose name is the date-time pattern and that carry the marker are ever removed; anything
+else in `From <name>` is left alone, and `From <name>` itself is removed when it ends up empty.
+
+**Pasted copies are removed.** The receiver puts a copy's files on its clipboard so that it sees another
+program ask for them (Mac: file URLs given lazily by a pasteboard data provider; Linux: a selection
+request for `text/uri-list` or `x-special/gnome-copied-files`). After such a request it waits until no
+other process has any of the copy's files open (Mac: `proc_listpidspath`; Linux: `/proc/*/fd`) and 10 s
+have passed since the request and since the last time one was open, then removes the copy and, if the
+clipboard still holds it, empties the clipboard: a second paste of the same copy offers nothing rather
+than files that are gone. A copy whose clipboard was replaced before any paste stays until it rolls.
 
 ## Shared clipboard (`usual_shortcuts` true, the default)
 

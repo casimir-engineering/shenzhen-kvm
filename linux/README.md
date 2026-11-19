@@ -15,9 +15,11 @@ Both follow `../PROTOCOL.md`.
   Control+Tab, and the Mac's volume and playback keys work here.
 - **Clipboard.** Copy anything here (any copy: Ctrl+C, a menu, right-click) and paste it on the other
   computer with its usual shortcut, and the other way round. Ctrl+C in a terminal stays an interrupt
-  and sends nothing. Files from the other computer land in `~/Downloads/From <its name>/<date time>/`
+  and sends nothing. Files from the other computer wait in `~/Downloads/From <its name>/<date time>/`
   and the clipboard then holds them (paste them in a file manager or an upload dialog). A paste pressed
-  before they have all arrived waits for them. When the usual shortcuts are switched off,
+  before they have all arrived waits for them. Once they are pasted (and the pasting program has
+  finished reading them) they are removed; the 5 most recent copies never pasted are kept. A file one
+  side already has from an earlier copy is not sent again. When the usual shortcuts are switched off,
   **Ctrl+Shift+C** copies here and sends, **Ctrl+Shift+V** pastes what the other computer copied.
 - **Top-bar app** (`shenzhen-kvm-tray`): the app's own icon in the top bar (the same as on the Mac):
   in full colour while sharing works, dimmed when the computers aren't linked or sharing is off, grey

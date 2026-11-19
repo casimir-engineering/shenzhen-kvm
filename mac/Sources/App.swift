@@ -64,6 +64,7 @@ final class MainWindow: NSObject, NSWindowDelegate, NSTextFieldDelegate {
     private let transfersBox = NSStackView()
     private let transfersTitle = label("Clipboard transfers", bold: true)
     private let transfersLine = line()
+    private let transfersNote = label("", size: 11, secondary: true)
     private var sheetShownFor = ""
     private var stack: NSStackView!
 
@@ -109,7 +110,7 @@ final class MainWindow: NSObject, NSWindowDelegate, NSTextFieldDelegate {
 
         let views: [NSView] = [head, status, permission, line(),
             linkTitle, linkHelp, visibleButton, visibleRow, visibleHint, foundTitle, foundBox, linkingRow, linkedRow, line()]
-            + settingsViews + [transfersTitle, transfersBox, transfersLine, smooth, smoothRow, line(),
+            + settingsViews + [transfersTitle, transfersNote, transfersBox, transfersLine, smooth, smoothRow, line(),
             label("Press both Shift keys at once to bring the mouse back to this Mac.", secondary: true)]
         transfersBox.orientation = .vertical; transfersBox.alignment = .leading; transfersBox.spacing = 6
         let stack = NSStackView(views: views)
@@ -261,6 +262,8 @@ final class MainWindow: NSObject, NSWindowDelegate, NSTextFieldDelegate {
         let list = core.transfers.snapshot().prefix(5)
         let linked = core.locked { core.link != nil }
         transfersTitle.isHidden = list.isEmpty || !linked; transfersBox.isHidden = list.isEmpty || !linked; transfersLine.isHidden = transfersBox.isHidden
+        transfersNote.stringValue = "Received files wait in Downloads › From \(otherComputer()) until you paste them, then they're removed. The 5 most recent you haven't pasted are kept."
+        transfersNote.isHidden = transfersBox.isHidden || !list.contains { !$0.toPeer && $0.what != "text" && $0.what != "picture" }
         transfersBox.arrangedSubviews.forEach { $0.removeFromSuperview() }
         for t in list {
             let title = label("\(t.direction) · \(t.what)", size: 12)
@@ -270,9 +273,12 @@ final class MainWindow: NSObject, NSWindowDelegate, NSTextFieldDelegate {
             case .running:
                 detail = t.total > 0 ? "\(Int(t.fraction * 100))% · \(sizeText(t.done)) of \(sizeText(t.total))" : sizeText(t.done)
                 if t.speed > 0 { detail += " · \(sizeText(UInt64(t.speed)))/s" }
-            case .done: detail = "Done · \(sizeText(t.total))" + (t.total >= 1 << 20 && t.speed > 0 ? " at \(sizeText(UInt64(t.speed)))/s" : "")
+            case .done:
+                if t.total == 0 && t.skipped > 0 { detail = t.toPeer ? "Already on \(otherComputer())" : "Already here" }
+                else { detail = "Done · \(sizeText(t.total))" + (t.total >= 1 << 20 && t.speed > 0 ? " at \(sizeText(UInt64(t.speed)))/s" : "") }
             case .failed: detail = "Failed: \(t.reason)"
             }
+            if !t.skippedText.isEmpty && !(t.total == 0 && t.state == .done) { detail += " · \(t.skippedText)" }
             if t.pasteWaiting && (t.state == .waiting || t.state == .running) { detail += " · your paste will happen when this is done" }
             let d = label(detail, size: 11, secondary: true)
             if t.state == .failed { d.textColor = .systemRed }
@@ -366,6 +372,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Installer.ejectInstallerDisk()
         let migrated = Migration.run()
         core = Core()
+        PasteWatch.shared.markOwnPasteboardChange = { [weak self] in self?.core.markOwnChange() }
         buildMainMenu()
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         let menu = NSMenu(); menu.delegate = self; item.menu = menu

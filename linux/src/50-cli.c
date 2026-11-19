@@ -28,17 +28,6 @@ static int ctl_line(int fd, buf_t *in, char *out, size_t on, int watch_stdin) {
         bput(in, b, n);
     }
 }
-/* The objects of a JSON array value, one at a time: returns a pointer after the object copied into out. */
-static const char *json_next_obj(const char *p, char *out, size_t on) {
-    while (*p && *p != '{' && *p != ']') p++;
-    if (*p != '{') return NULL;
-    int depth = 0, instr = 0; const char *s = p;
-    for (; *p; p++) {
-        if (instr) { if (*p == '\\' && p[1]) p++; else if (*p == '"') instr = 0; continue; }
-        if (*p == '"') instr = 1; else if (*p == '{') depth++; else if (*p == '}' && !--depth) { p++; break; }
-    }
-    size_t l = p - s; if (l >= on) l = on - 1; memcpy(out, s, l); out[l] = 0; return p;
-}
 static const char *method_words(const char *obj) {
     static char w[200]; w[0] = 0;
     static const char *names[] = {"mdns", "the network's name service", "broadcast", "a broadcast", "multicast", "a multicast", "ipv6", "IPv6", "sweep", "asking each address"};

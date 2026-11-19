@@ -1,8 +1,11 @@
 import AppKit
+import CryptoKit
 
 /// CLIP_DATA body (kind byte + data) from the Mac pasteboard. Call on the main thread.
 func readPasteboard() -> [UInt8] {
     let pb = NSPasteboard.general
+    if let mine = PasteWatch.shared.ownFiles(pb) { return encodeFiles(mine) }   // known without reading (keeps the paste noticeable)
+    PasteWatch.shared.selfReading = true; defer { PasteWatch.shared.selfReading = false }
     if let urls = pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty {
         return encodeFiles(urls)
     }
@@ -78,12 +81,10 @@ func writePasteboard(_ body: [UInt8]) -> Bool {
     case 3:
         guard let count = r.u16() else { return false }
         let fm = FileManager.default
-        let fmt = DateFormatter(); fmt.dateFormat = "yyyy-MM-dd HH.mm.ss"
         let root0 = receivedFilesRoot()
-        var root = root0.appendingPathComponent(fmt.string(from: Date()))
-        var k = 2
-        while fm.fileExists(atPath: root.path) { root = root0.appendingPathComponent(fmt.string(from: Date()) + " \(k)"); k += 1 }
-        var tops: [String] = []
+        try? fm.createDirectory(at: root0, withIntermediateDirectories: true)
+        let root = newReceivedFolder(root0)
+        var tops: [String] = [], made: [(rel: String, size: UInt64, sha: [UInt8])] = []
         for _ in 0..<count {
             guard let nl = r.u16(), let nb = r.bytes(Int(nl)), let name = String(bytes: nb, encoding: .utf8),
                   let sz = r.u64(), let data = r.bytes(Int(sz)) else { return false }
@@ -91,12 +92,13 @@ func writePasteboard(_ body: [UInt8]) -> Bool {
             guard !name.hasPrefix("/"), !parts.isEmpty, !parts.contains(".."), !parts.contains(".") else { return false }
             let dest = parts.reduce(root) { $0.appendingPathComponent($1) }
             try? fm.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
-            guard (try? Data(data).write(to: dest)) != nil else { return false }
+            guard (try? Data(data).write(to: dest)) != nil else { try? fm.removeItem(at: root); return false }
+            made.append((name, UInt64(data.count), Array(SHA256.hash(data: Data(data)))))
             if !tops.contains(parts[0]) { tops.append(parts[0]) }
         }
-        try? fm.createDirectory(at: root, withIntermediateDirectories: true)
-        pb.clearContents()
-        pb.writeObjects(tops.map { root.appendingPathComponent($0) as NSURL })
+        writeMarker(root, made)
+        PasteWatch.shared.put(tops.map { root.appendingPathComponent($0) }, folder: root, on: pb)
+        rollKeptCopies(root0, protect: tops.map { root.appendingPathComponent($0) })
         log("received \(count) file(s) into \(root.path)")
         return true
     default:
