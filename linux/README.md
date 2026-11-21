@@ -35,7 +35,14 @@ Both follow `../PROTOCOL.md`.
   mice act there; it shows again when the pointer comes back.
 - If the other computer goes silent for 2 seconds while its keyboard is in use here, every key and
   button it was holding is released.
-- **Which desktop.** The service uses the desktop on the lowest-numbered X display (the main one,
+- **Weston desktops** (a compositor without X, such as a single-app kiosk) work when Weston loads the
+  `kvm-desk.so` module, which gives the service the pointer, its screens, the cursor and the clipboard
+  through `/run/shenzhen-kvm/desk.sock`. The service uses Weston whenever that module answers, else X;
+  `"desk": "weston"` or `"desk": "x11"` in `/etc/shenzhen-kvm/config.json` chooses one. The pointer
+  crosses over all of Weston's screens. Text and pictures copied to a Weston desktop can be up to
+  16 MB (files have no such limit); received files go to the Downloads folder of the user named like
+  the socket's group (the browser session's user), else root's.
+- **Which desktop (X).** The service uses the desktop on the lowest-numbered X display (the main one,
   `:1` on a computer whose desktop runs there). A computer that runs a second desktop on another
   display for a second screen (`:2`) keeps sharing with the main one only; `"display": ":2"` in
   `/etc/shenzhen-kvm/config.json` chooses another. The top-bar app runs once, in the main desktop's
@@ -51,7 +58,7 @@ As root, from a copy of this repository: `linux/install.sh`. It builds with this
 | the service | `/usr/local/bin/shenzhen-kvm`, `shenzhen-kvm.service` (enabled, started) |
 | the top-bar app | `/usr/local/bin/shenzhen-kvm-tray`, started with the desktop through `/etc/xdg/autostart/shenzhen-kvm-tray.desktop`, also in the applications menu |
 | icons | `/usr/share/icons/hicolor/<size>/apps/shenzhen-kvm.png` |
-| this computer's settings | `/etc/shenzhen-kvm/config.json`: `speed` (multiplier for the other computer's pointer here), `display` (which desktop) |
+| this computer's settings | `/etc/shenzhen-kvm/config.json`: `speed` (multiplier for the other computer's pointer here), `display` (which X desktop), `desk` (`x11` or `weston`) |
 
 and keeps backups with an undo script (`/var/lib/shenzhen-kvm/undo.sh`, or `install.sh --undo`).
 An earlier install of this service under another name (a systemd unit that runs `…kvm-share run`) is
@@ -80,24 +87,28 @@ They work for root and for the person who owns the desktop (the user running the
 - One C program, `shenzhen-kvm.c` (its parts are in `src/`), with libsodium (ChaCha20-Poly1305,
   X25519, SHA-256) and libX11; libXfixes is loaded at run time to watch the clipboard. Three
   processes: **main** keeps the input path (UDP packets to `/dev/uinput`, physical devices to UDP; no
-  sleeps, no batching) and the linked computer's presence; **helper** owns the X connection (pointer
-  queries, the clipboard) and the TCP clipboard channel; **agent** serves the control socket
+  sleeps, no batching) and the linked computer's presence; **helper** owns the desktop connection
+  (pointer queries, the clipboard) and the TCP clipboard channel; **agent** serves the control socket
   (`/run/shenzhen-kvm/control.sock`, newline-delimited JSON, used by the top-bar app and the command
   line), finds computers and links them.
 - Input is injected through two uinput devices, `Shenzhen KVM keyboard` and `Shenzhen KVM pointer`,
   created once when the service starts and destroyed only when it stops: a settings or `config.json`
   change is applied in place, and a link change restarts the service with the devices handed over, so
   the desktop never sees them go and come back.
-  The pointer device is absolute (0..65535): the service keeps the pointer position itself and applies
-  the other computer's movements 1:1 times `speed`. Keyboards plugged in here are held by the service
+  The service keeps the pointer position itself and applies the other computer's movements 1:1 times
+  `speed`. Under X the pointer device is absolute (0..65535 over the whole screen). Weston maps an
+  absolute device to one screen only, so there the pointer device is a relative mouse that never moves
+  (its buttons and wheel act where the pointer is) and the pointer is placed with the module's WARP;
+  a button or wheel event waits until the WARP sent before it is applied (at most 250 ms). Keyboards plugged in here are held by the service
   (EVIOCGRAB) and replayed through its keyboard, so shortcuts can be caught and go to the other
   computer while it drives it; mice are held only while driving the other computer.
 - The X server and its auth file are found from the X server's command line (`Xwayland`, `Xorg`, `X`
   or `Xvfb`); the desktop's user is the owner of that process. A desktop restart is followed.
   Everything the service asks of the desktop (where the pointer is, the screen size, hiding the
   pointer, the clipboard, whether a terminal has focus) goes through the `desk_*` functions in
-  `src/15-desk.c`; `src/16-desk-x11.c` implements them for X11, and a Wayland backend would implement
-  the same functions.
+  `src/15-desk.c`; `src/16-desk-x11.c` implements them for X11 and `src/17-desk-weston.c` for Weston.
+  Weston's module takes one client, so under Weston the main process owns that connection (it places
+  the pointer on the input path) and passes the helper's requests through in order.
 - Files: `/var/lib/shenzhen-kvm/id` (this computer's id), `link` (the linked computer and its key,
   mode 0600), `settings.json` (the shared settings, from this computer's side). None of them belongs in
   a disk image: each computer makes its own id, and is linked by its person.

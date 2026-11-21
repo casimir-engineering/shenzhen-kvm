@@ -1,7 +1,6 @@
 /* ======================================================================================
  * HELPER PROCESS: the desktop (15-desk.c), clipboard, TCP 24801
  * ====================================================================================== */
-static int hfd;   /* socket to main */
 static char peer_name[128] = "the other computer";   /* the peer's name (link, then its HELLO) */
 static int here = 1;                  /* the pointer is on this computer (told by main) */
 static int xfer_seq, xfer_in = -1;    /* transfers shown in the tray app */
@@ -663,6 +662,7 @@ static void tcp_serve(int lfd) {
 
 static uint64_t snap_stamp;   /* the clipboard before the local copy keys */
 static void helper_cmd(uint8_t t, buf_t *b) {
+    if (t == 'Y' || t == 'e' || t == 'd') { wd_cmd(t, b); return; }   /* Weston, through main */
     if (t == 'H' && b->n >= 1) { here = b->p[0]; cursor_follow(); return; }
     if (t == 'G') {   /* main's current settings */
         char j[4096]; size_t n = b->n < sizeof j - 2 ? b->n : sizeof j - 2; memcpy(j, b->p, n); j[n] = 0;
@@ -764,12 +764,13 @@ static void helper_main(int fd) {
     buf_t b = {0};
     for (;;) {
         if (!desk_connected() && mono_ms() >= next_try) {
-            if (desk_connect()) { cursor_hidden = 0; cursor_follow(); } else next_try = mono_ms() + 2000;
+            if (desk_connect()) { cursor_hidden = 0; cursor_follow(); } else next_try = mono_ms() + (desk_kind == DESK_WESTON ? 200 : 2000);
         }
+        { uint8_t qt; while (wd_take_queued(&qt, &b)) helper_cmd(qt, &b); }   /* what came while waiting for Weston */
         struct pollfd q[3] = {{hfd, POLLIN, 0}, {lfd, POLLIN, 0}, {desk_fd(), POLLIN, 0}};
         desk_pump(0);
         int watching = 0; for (int i = 0; i < MAXWATCH; i++) if (pw[i].dir[0]) watching = 1;
-        if (poll(q, 3, watching ? 1000 : desk_connected() ? 5000 : 2000) < 0 && errno != EINTR) _exit(5);
+        if (poll(q, 3, watching ? 1000 : desk_connected() ? 5000 : desk_kind == DESK_WESTON ? 200 : 2000) < 0 && errno != EINTR) _exit(5);
         if (watching) paste_watch_tick();
         if (push_pid > 0 && waitpid(push_pid, NULL, WNOHANG) == push_pid) push_pid = 0;
         if (q[0].revents) { uint8_t t; if (hrecv(hfd, &t, &b)) _exit(0); helper_cmd(t, &b); }

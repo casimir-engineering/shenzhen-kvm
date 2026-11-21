@@ -10,7 +10,10 @@ static int64_t helper_restart_at, agent_restart_at;
 static struct sockaddr_in last_src;
 static dsock_t pres = {-1, -1, 0};   /* presence of the linked peer: the input port, IPv4 and IPv6 */
 static uint64_t rx_high;
-static int scr_w = 3440, scr_h = 1440;
+static int scr_w = 3440, scr_h = 1440, scr_x, scr_y;   /* the bounding box of the screens */
+#define MAXOUT 8
+static int outs[MAXOUT][4] = {{0, 0, 3440, 1440}}, nouts = 1;   /* the screens: x, y, w, h */
+static buf_t ptr_defer;               /* pointer device events held until the WARPs before them are applied (Weston) */
 static double px, py;                 /* tracked pointer position (driven) */
 static int exit_edge;                 /* the edge the pointer last left through */
 static int injected_down[KEY_CNT];    /* keys held on the virtual keyboard */
@@ -91,14 +94,21 @@ static int ui_create(int pointer) {
     struct uinput_setup s = {.id = {BUS_VIRTUAL, 0x1209, pointer ? 0x4b56 : 0x4b4b, 1}};
     if (pointer) {
         snprintf(s.name, sizeof s.name, "Shenzhen KVM pointer");
-        ioctl(fd, UI_SET_EVBIT, EV_KEY); ioctl(fd, UI_SET_EVBIT, EV_ABS); ioctl(fd, UI_SET_EVBIT, EV_REL);
+        /* X11: absolute (0..65535 over the whole screen space). Weston maps an absolute device to one
+           screen only, so there the pointer is placed with WARP and this device is a relative mouse that
+           never moves: its buttons and wheel act where WARP put the pointer. */
+        ioctl(fd, UI_SET_EVBIT, EV_KEY); ioctl(fd, UI_SET_EVBIT, EV_REL);
         int b[] = {BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA};
         for (unsigned i = 0; i < 5; i++) ioctl(fd, UI_SET_KEYBIT, b[i]);
         int r[] = {REL_WHEEL, REL_HWHEEL, REL_WHEEL_HI_RES, REL_HWHEEL_HI_RES};
         for (unsigned i = 0; i < 4; i++) ioctl(fd, UI_SET_RELBIT, r[i]);
-        for (int ax = ABS_X; ax <= ABS_Y; ax++) {
-            struct uinput_abs_setup a = {.code = ax, .absinfo = {.minimum = 0, .maximum = 65535}};
-            ioctl(fd, UI_SET_ABSBIT, ax); ioctl(fd, UI_ABS_SETUP, &a);
+        if (pointer == 2) { ioctl(fd, UI_SET_RELBIT, REL_X); ioctl(fd, UI_SET_RELBIT, REL_Y); }
+        else {
+            ioctl(fd, UI_SET_EVBIT, EV_ABS);
+            for (int ax = ABS_X; ax <= ABS_Y; ax++) {
+                struct uinput_abs_setup a = {.code = ax, .absinfo = {.minimum = 0, .maximum = 65535}};
+                ioctl(fd, UI_SET_ABSBIT, ax); ioctl(fd, UI_ABS_SETUP, &a);
+            }
         }
     } else {
         snprintf(s.name, sizeof s.name, "Shenzhen KVM keyboard");
@@ -119,12 +129,59 @@ static void inject_key(int k, int down) {
     if (down == injected_down[k] && down) return;
     injected_down[k] = down; ev(EV_KEY, k, down); flush_to(kfd);
 }
-static void place_pointer(double x, double y) {
-    if (x < 0) x = 0; if (y < 0) y = 0; if (x > scr_w - 1) x = scr_w - 1; if (y > scr_h - 1) y = scr_h - 1;
-    px = x; py = y;
-    ev(EV_ABS, ABS_X, (int)(((int64_t)(int)x * 65536 + 32768) / scr_w));
-    ev(EV_ABS, ABS_Y, (int)(((int64_t)(int)y * 65536 + 32768) / scr_h));
+/* --- the screens (one under X11: its root window; Weston's outputs) --- */
+static int on_out(double x, double y) {
+    for (int i = 0; i < nouts; i++) if (x >= outs[i][0] && x < outs[i][0] + outs[i][2] && y >= outs[i][1] && y < outs[i][1] + outs[i][3]) return i;
+    return -1;
+}
+/* Onto a screen: the one the pointer is on (fx, fy) when the point is beside it, as the desktop
+   keeps it there, else the nearest. */
+static void clamp_from(double fx, double fy, double *x, double *y) {
+    if (on_out(*x, *y) >= 0) return;
+    double bx = *x, by = *y, bd = -1;
+    int from = on_out(fx, fy);
+    for (int i = 0; i < nouts; i++) {
+        if (from >= 0 && i != from) continue;
+        double cx = *x < outs[i][0] ? outs[i][0] : *x > outs[i][0] + outs[i][2] - 1 ? outs[i][0] + outs[i][2] - 1 : *x;
+        double cy = *y < outs[i][1] ? outs[i][1] : *y > outs[i][1] + outs[i][3] - 1 ? outs[i][1] + outs[i][3] - 1 : *y;
+        double d = (cx - *x) * (cx - *x) + (cy - *y) * (cy - *y);
+        if (bd < 0 || d < bd) { bd = d; bx = cx; by = cy; }
+    }
+    *x = bx; *y = by;
+}
+static void clamp_pt(double *x, double *y) { clamp_from(-1e9, -1e9, x, y); }
+/* The screens changed (Weston's layout, or the X root's size). */
+static void desk_layout(int n, const int *r) {
+    if (n < 1) return; if (n > MAXOUT) n = MAXOUT;
+    int x1 = r[0], y1 = r[1], x2 = r[0] + r[2], y2 = r[1] + r[3];
+    for (int i = 0; i < n; i++) {
+        for (int k = 0; k < 4; k++) outs[i][k] = r[4 * i + k];
+        if (r[4 * i] < x1) x1 = r[4 * i]; if (r[4 * i + 1] < y1) y1 = r[4 * i + 1];
+        if (r[4 * i] + r[4 * i + 2] > x2) x2 = r[4 * i] + r[4 * i + 2]; if (r[4 * i + 1] + r[4 * i + 3] > y2) y2 = r[4 * i + 1] + r[4 * i + 3];
+    }
+    int changed = n != nouts || x1 != scr_x || y1 != scr_y || x2 - x1 != scr_w || y2 - y1 != scr_h;
+    nouts = n; scr_x = x1; scr_y = y1; scr_w = x2 - x1; scr_h = y2 - y1;
+    if (changed && desk_kind == DESK_WESTON) logmsg("screens: %d, %dx%d in all", n, scr_w, scr_h);
+}
+/* The pointer device's events, written now, or under Weston after the WARPs sent before them are
+   applied (so a click lands where the pointer was moved to). */
+static void flush_ptr(void) {
+    if (!evn) return;
+    if (desk_kind == DESK_WESTON && wm_busy()) { ev(EV_SYN, SYN_REPORT, 0); bput(&ptr_defer, evq, evn * sizeof *evq); evn = 0; return; }
+    if (ptr_defer.n) { write_all(pfd, ptr_defer.p, ptr_defer.n); ptr_defer.n = 0; }
     flush_to(pfd);
+}
+static void ptr_defer_flush(void) { if (ptr_defer.n) { write_all(pfd, ptr_defer.p, ptr_defer.n); ptr_defer.n = 0; } }
+/* Moves this computer's pointer to x, y (already on a screen). */
+static void pointer_to(double x, double y) {
+    if (desk_kind == DESK_WESTON) { wm_warp(x, y); return; }
+    ev(EV_ABS, ABS_X, (int)(((int64_t)(int)(x - scr_x) * 65536 + 32768) / scr_w));
+    ev(EV_ABS, ABS_Y, (int)(((int64_t)(int)(y - scr_y) * 65536 + 32768) / scr_h));
+}
+static void place_pointer(double x, double y) {
+    clamp_pt(&x, &y);
+    px = x; py = y;
+    pointer_to(x, y); flush_ptr();
 }
 static int raw_down[256];             /* the peer's keys as it sent them (HID usages), before mapping */
 static int switcher_key, ctrl_tab_key;  /* modifier held here for the peer's Command+Tab / Control+Tab, 0 = none */
@@ -134,7 +191,7 @@ static void release_all(void) {
     flush_to(kfd);
     int b[] = {0, BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA};
     for (int i = 1; i <= 5; i++) if (btn_down[i]) { btn_down[i] = 0; ev(EV_KEY, b[i], 0); }
-    flush_to(pfd);
+    flush_ptr();
 }
 
 /* --- UDP --- */
@@ -152,16 +209,35 @@ static void send_key_mac(unsigned usage, int down) {
 }
 
 static uint16_t pos_along(int edge, double x, double y) {
-    double f = (edge >= 2) ? x / (scr_w > 1 ? scr_w - 1 : 1) : y / (scr_h > 1 ? scr_h - 1 : 1);
+    double f = (edge >= 2) ? (x - scr_x) / (scr_w > 1 ? scr_w - 1 : 1) : (y - scr_y) / (scr_h > 1 ? scr_h - 1 : 1);
     if (f < 0) f = 0; if (f > 1) f = 1; return (uint16_t)(f * 65535 + 0.5);
 }
+/* The point just inside the outer boundary on edge at pos. */
 static void edge_point(int edge, uint16_t pos, int inset, double *x, double *y) {
-    double f = pos / 65535.0;
-    switch (edge) {
-    case 0: *x = inset; *y = f * (scr_h - 1); break;
-    case 1: *x = scr_w - 1 - inset; *y = f * (scr_h - 1); break;
-    case 2: *x = f * (scr_w - 1); *y = inset; break;
-    default: *x = f * (scr_w - 1); *y = scr_h - 1 - inset; break;
+    double f = pos / 65535.0; int best = -1;
+    if (edge >= 2) {
+        *x = scr_x + f * (scr_w - 1);
+        for (int i = 0; i < nouts; i++) if (*x >= outs[i][0] && *x < outs[i][0] + outs[i][2]) {
+            if (best < 0 || (edge == 2 ? outs[i][1] < outs[best][1] : outs[i][1] + outs[i][3] > outs[best][1] + outs[best][3])) best = i;
+        }
+        *y = best < 0 ? (edge == 2 ? scr_y : scr_y + scr_h - 1) : edge == 2 ? outs[best][1] + inset : outs[best][1] + outs[best][3] - 1 - inset;
+    } else {
+        *y = scr_y + f * (scr_h - 1);
+        for (int i = 0; i < nouts; i++) if (*y >= outs[i][1] && *y < outs[i][1] + outs[i][3]) {
+            if (best < 0 || (edge == 0 ? outs[i][0] < outs[best][0] : outs[i][0] + outs[i][2] > outs[best][0] + outs[best][2])) best = i;
+        }
+        *x = best < 0 ? (edge == 0 ? scr_x : scr_x + scr_w - 1) : edge == 0 ? outs[best][0] + inset : outs[best][0] + outs[best][2] - 1 - inset;
+    }
+    clamp_pt(x, y);
+}
+/* x, y (on screen i) is on the outer boundary of the screens on edge e: nothing just beyond it. */
+static int outer(int i, double x, double y, int e) {
+    const int *o = outs[i];
+    switch (e) {
+    case 0: return x <= o[0] + 0.5 && on_out(o[0] - 2, y) < 0;
+    case 1: return x >= o[0] + o[2] - 1.5 && on_out(o[0] + o[2] + 1, y) < 0;
+    case 2: return y <= o[1] + 0.5 && on_out(x, o[1] - 2) < 0;
+    default: return y >= o[1] + o[3] - 1.5 && on_out(x, o[1] + o[3] + 1) < 0;
     }
 }
 
@@ -174,11 +250,13 @@ static int push_edge = -1; static double push_amt; static int64_t push_at;
 static void push_reset(void) { push_edge = -1; push_amt = 0; }
 static int pushed(double x, double y, double dx, double dy) {
     int64_t now = mono_ms(), last = push_at; push_at = now;
-    int e = x <= 0 && dx < 0 ? 0 : x >= scr_w - 1 && dx > 0 ? 1 : y <= 0 && dy < 0 ? 2 : y >= scr_h - 1 && dy > 0 ? 3 : -1;
+    int i = on_out(x, y), e = -1;
+    if (i >= 0) e = dx < 0 && outer(i, x, y, 0) ? 0 : dx > 0 && outer(i, x, y, 1) ? 1 : dy < 0 && outer(i, x, y, 2) ? 2 : dy > 0 && outer(i, x, y, 3) ? 3 : -1;
     if (e < 0) { push_reset(); return -1; }
     double out = e == 0 ? -dx : e == 1 ? dx : e == 2 ? -dy : dy;
     double along = e >= 2 ? (dx < 0 ? -dx : dx) : (dy < 0 ? -dy : dy);
-    double a = e >= 2 ? x : y, b = e >= 2 ? scr_w - 1 - x : scr_h - 1 - y;   /* to the corners along the edge */
+    /* to the corners of this screen along the edge */
+    double a = e >= 2 ? x - outs[i][0] : y - outs[i][1], b = e >= 2 ? outs[i][0] + outs[i][2] - 1 - x : outs[i][1] + outs[i][3] - 1 - y;
     if (a < CORNER_ZONE || b < CORNER_ZONE || along > 2 * out) { push_reset(); return -1; }
     if (e != push_edge || now - last > PUSH_GAP_MS) push_amt = 0;
     push_edge = e; push_amt += out;
@@ -186,7 +264,8 @@ static int pushed(double x, double y, double dx, double dy) {
     push_reset(); return e;
 }
 
-static void query(uint8_t tag) { if (hsock >= 0 && !query_out) { query_out = 1; injected_since_query = 0; last_query_ms = mono_ms(); hsend(hsock, 'Q', &tag, 1); } }
+/* Asks the helper where the X pointer is (Weston's position comes by itself, POINTER). */
+static void query(uint8_t tag) { if (desk_kind == DESK_WESTON) { if (tag == 1) wm_query(); return; } if (hsock >= 0 && !query_out) { query_out = 1; injected_since_query = 0; last_query_ms = mono_ms(); hsend(hsock, 'Q', &tag, 1); } }
 
 static void end_driven(const char *why) {
     if (state != DRIVEN && state != LEAVING) return;
@@ -346,7 +425,7 @@ static void handle_udp(void) {
                 if (!holding()) continue;
                 double nx = px + dx * cfg.speed, ny = py + dy * cfg.speed;
                 int nob = !btn_down[1] && !btn_down[2] && !btn_down[3];
-                double cx = nx < 0 ? 0 : nx > scr_w - 1 ? scr_w - 1 : nx, cy = ny < 0 ? 0 : ny > scr_h - 1 ? scr_h - 1 : ny;
+                double cx = nx, cy = ny; clamp_from(px, py, &cx, &cy);
                 int out = -1;
                 /* outward: only what goes past the edge counts */
                 if (!nob) push_reset(); else if (st.drives_peer) out = pushed(cx, cy, nx != cx ? nx - cx : dx * cfg.speed, ny != cy ? ny - cy : dy * cfg.speed);
@@ -354,9 +433,7 @@ static void handle_udp(void) {
                     place_pointer(cx, cy); hand_over(cx, cy, out);
                     continue;
                 }
-                px = cx; py = cy;
-                ev(EV_ABS, ABS_X, (int)(((int64_t)(int)px * 65536 + 32768) / scr_w));
-                ev(EV_ABS, ABS_Y, (int)(((int64_t)(int)py * 65536 + 32768) / scr_h));
+                px = cx; py = cy; pointer_to(px, py);
                 moved = 1; injected_since_query = 1;
             } else if (t == 0x11 && i + 3 <= ml) {   /* BUTTON */
                 int b = m[i + 1], d = m[i + 2] ? 1 : 0; i += 3;
@@ -383,9 +460,9 @@ static void handle_udp(void) {
             } else if (t == 0x1F) {                  /* ALIVE */
                 i += 1; send_ack(0x1F, &src);
             } else break;
-            if (evn > 48 && moved) { flush_to(pfd); }
+            if (evn > 48 && moved) { flush_ptr(); }
         }
-        if (moved) flush_to(pfd);
+        if (moved) flush_ptr();
         if (moved || keyed) lat_record(t0);
     }
 }
@@ -486,7 +563,7 @@ static void handle_dev(struct dev *d) {
             int hold = state == IDLE || state == DRIVEN;
             if (hold) {   /* this computer's own mouse moved the pointer: follow it (the query below corrects it) */
                 px += dx; py += dy;
-                if (px < 0) px = 0; if (py < 0) py = 0; if (px > scr_w - 1) px = scr_w - 1; if (py > scr_h - 1) py = scr_h - 1;
+                clamp_from(px - dx, py - dy, &px, &py);
                 pos_dirty = 1;
             }
             int64_t now = mono_ms();

@@ -6,6 +6,7 @@
 #include "src/10-config.c"
 #include "src/15-desk.c"
 #include "src/16-desk-x11.c"
+#include "src/17-desk-weston.c"
 #include "src/20-helper.c"
 #include "src/30-main.c"
 #include "src/35-run.c"

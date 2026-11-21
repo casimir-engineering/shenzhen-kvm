@@ -57,10 +57,10 @@ static void root_size(int *w, int *h) {
     XGetGeometry(dpy, xroot, &r, &x, &y, &gw, &gh, &bw, &dep); *w = (int)gw; *h = (int)gh;
 }
 
-static int desk_connected(void) { return dpy != NULL; }
-static int desk_fd(void) { return dpy ? ConnectionNumber(dpy) : -1; }
+static int x11_connected(void) { return dpy != NULL; }
+static int x11_fd(void) { return dpy ? ConnectionNumber(dpy) : -1; }
 
-static int desk_connect(void) {
+static int x11_connect(void) {
     char disp[32], auth[512];
     uid_t owner = 0;
     if (!find_display(disp, sizeof disp, auth, sizeof auth, &owner)) return 0;
@@ -99,7 +99,7 @@ static int desk_connect(void) {
     return 1;
 }
 
-static int desk_pointer(int *x, int *y, unsigned *buttons, int *w, int *h) {
+static int x11_pointer(int *x, int *y, unsigned *buttons, int *w, int *h) {
     if (!dpy) return 0;
     Window rr, cr; int rx, ry, wx, wy; unsigned m;
     XQueryPointer(dpy, xroot, &rr, &cr, &rx, &ry, &wx, &wy, &m);
@@ -109,7 +109,7 @@ static int desk_pointer(int *x, int *y, unsigned *buttons, int *w, int *h) {
     return 1;
 }
 
-static int desk_hide_cursor(int hide) {
+static int x11_hide_cursor(int hide) {
     if (!dpy || !fix_hide || !fix_show) return 0;
     if (hide) fix_hide(dpy, xroot); else fix_show(dpy, xroot);
     XFlush(dpy); return 1;
@@ -190,7 +190,7 @@ static void handle_xevent(XEvent *e) {
     else if (e->type == PropertyNotify && e->xproperty.window != xwin) incr_step(&e->xproperty);
     else if (e->type == ConfigureNotify && e->xconfigure.window == xroot) { int w, h; root_size(&w, &h); desk_on_size(w, h); }
 }
-static void desk_pump(short revents) {
+static void x11_pump(short revents) {
     if (!dpy) return;
     if (revents & (POLLHUP | POLLERR)) xioerr(dpy);
     if ((revents & POLLIN) && !XPending(dpy)) XSync(dpy, False);
@@ -247,9 +247,9 @@ static int x_convert(Atom target, buf_t *out, Atom *type) {
 static int has_atom(Atom *l, int n, Atom a) { for (int i = 0; i < n; i++) if (l[i] == a) return 1; return 0; }
 static Atom offered[64]; static int n_offered;   /* the targets the clipboard offered at the last desk_clip_formats */
 
-static int desk_clip_ours(void) { return dpy && held.own && XGetSelectionOwner(dpy, A_CLIP) == xwin; }
+static int x11_clip_ours(void) { return dpy && held.own && XGetSelectionOwner(dpy, A_CLIP) == xwin; }
 
-static int desk_clip_formats(void) {
+static int x11_clip_formats(void) {
     buf_t t = {0}; Atom type; int f = 0;
     n_offered = 0;
     if (dpy && XGetSelectionOwner(dpy, A_CLIP) != None && x_convert(A_TARGETS, &t, &type)) {
@@ -264,7 +264,7 @@ static int desk_clip_formats(void) {
     bfree(&t); return f;
 }
 
-static int desk_clip_get(int cf, buf_t *out) {
+static int x11_clip_get(int cf, buf_t *out) {
     if (!dpy) return 0;
     Atom type;
     if (cf == CF_URIS) return x_convert(A_URIS, out, &type);
@@ -275,7 +275,7 @@ static int desk_clip_get(int cf, buf_t *out) {
     return 0;
 }
 
-static int desk_clip_take(void) {
+static int x11_clip_take(void) {
     if (!dpy) return 0;
     held_t = x_time();
     XSetSelectionOwner(dpy, A_CLIP, xwin, held_t);
@@ -283,12 +283,12 @@ static int desk_clip_take(void) {
     return held.own;
 }
 
-static void desk_clip_drop(void) {
+static void x11_clip_drop(void) {
     if (dpy && held.own) { XSetSelectionOwner(dpy, A_CLIP, None, CurrentTime); XFlush(dpy); }
     held.own = 0;
 }
 
-static uint64_t desk_clip_stamp(void) {
+static uint64_t x11_clip_stamp(void) {
     if (!dpy) return 0;
     Window o = XGetSelectionOwner(dpy, A_CLIP);
     long ts = 0;
@@ -296,7 +296,7 @@ static uint64_t desk_clip_stamp(void) {
     return (uint64_t)o << 32 ^ (uint32_t)ts;
 }
 
-static int desk_active_is_terminal(void) {
+static int x11_active_is_terminal(void) {
     if (!dpy) return 0;
     Atom t; int f; unsigned long n, a; unsigned char *d = NULL; int term = 0;
     if (XGetWindowProperty(dpy, xroot, A_ACTIVE, 0, 1, False, XA_WINDOW, &t, &f, &n, &a, &d) != Success || !d || !n) { if (d) XFree(d); return 0; }

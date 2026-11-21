@@ -56,6 +56,7 @@ static void close_inherited(void) {
     for (int i = 0; i < MAXDEV; i++) if (devs[i].fd > 0) close(devs[i].fd);
 }
 static void send_local_settings(int to) { buf_t b = {0}; settings_json(&b, 0); hsend(to, 'G', b.p, b.n); bfree(&b); }
+static int x11_seen;                    /* the helper is connected to an X desktop */
 static void helper_start(void) {
     int sv[2];
     if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv)) return;
@@ -64,10 +65,13 @@ static void helper_start(void) {
     close(sv[1]);
     if (p < 0) { close(sv[0]); return; }
     helper_pid = p; hsock = sv[0]; query_out = 0; tell_here(); send_local_settings(hsock);
+    if (desk_kind == DESK_WESTON && wm_hello) { uint8_t up = 1; hsend(hsock, 'Y', &up, 1); }
 }
+static int desk_to_helper(uint8_t t, const void *d, uint32_t n) { return hsock >= 0 ? hsend(hsock, t, d, n) : -1; }
 static void helper_lost(void) {
     if (hsock >= 0) close(hsock);
-    hsock = -1; query_out = 0; pending_copy = pending_paste = 0; cursor_hidden_here = 0;
+    hsock = -1; query_out = 0; pending_copy = pending_paste = 0; cursor_hidden_here = 0; x11_seen = 0;
+    wm_helper_gone();
     int stt; waitpid(helper_pid, &stt, 0);
     helper_restart_at = mono_ms() + 1000;
 }
@@ -108,8 +112,8 @@ static void tell_agent(int force) {
 }
 static void diag_json(buf_t *b) {
     uint64_t avg = lat_n ? lat_sum_ns / lat_n / 1000 : 0;
-    bprintf(b, "{\"state\": \"%s\", \"pointer\": [%d, %d], \"screen\": [%d, %d], \"speed\": %.2f, \"inject_us\": {\"count\": %llu, \"avg\": %llu, \"max\": %llu}, \"net_ms\": {\"moves\": %llu, ",
-            STATE_NAMES[state], (int)px, (int)py, scr_w, scr_h, cfg.speed, (unsigned long long)lat_n, (unsigned long long)avg, (unsigned long long)(lat_max_ns / 1000), (unsigned long long)net_moves);
+    bprintf(b, "{\"state\": \"%s\", \"pointer\": [%d, %d], \"screen\": [%d, %d], \"desktop\": \"%s\", \"speed\": %.2f, \"inject_us\": {\"count\": %llu, \"avg\": %llu, \"max\": %llu}, \"net_ms\": {\"moves\": %llu, ",
+            STATE_NAMES[state], (int)px, (int)py, scr_w, scr_h, desk_kind == DESK_WESTON ? (wm_hello ? "weston" : "weston (not connected)") : x11_seen ? "x11" : "x11 (not connected)", cfg.speed, (unsigned long long)lat_n, (unsigned long long)avg, (unsigned long long)(lat_max_ns / 1000), (unsigned long long)net_moves);
     char t[1024]; int k = net_json(t, sizeof t, "arrival_gap", net_arr); bput(b, t, k); bputs(b, ", ");
     k = net_json(t, sizeof t, "delay_above_min", net_late); bput(b, t, k); bputs(b, "}}");
 }
@@ -126,10 +130,60 @@ static void settings_applied(int tell_peer) {
     }
     tell_agent(0);
 }
+/* This computer's own mouse moved the pointer to x, y: on an edge, add the moves to the push. */
+static void local_edge(double x, double y, unsigned b) {
+    int hold = state == IDLE || state == DRIVEN;
+    double mx = loc_dx, my = loc_dy; loc_dx = loc_dy = 0;
+    if (hold && mono_ms() >= cooldown_ms && st.sharing && st.drives_peer && shm->peer_ip && !(b & (DESK_LEFT | DESK_MIDDLE | DESK_RIGHT))) {
+        int e = pushed(x, y, mx, my);
+        if (e >= 0) hand_over(x, y, e);
+    } else push_reset();
+}
+/* Weston: where the pointer went (real movement only; WARPs report nothing). */
+static void desk_pointer_seen(double x, double y, unsigned b) {
+    int hold = state == IDLE || state == DRIVEN;
+    if (hold && !wm_busy()) { px = x; py = y; pos_dirty = 0; }
+    if (loc_dx || loc_dy) local_edge(x, y, b);
+}
+/* Weston applied every WARP sent: the held button and wheel events go now, and if Weston kept the
+   pointer elsewhere (a gap between screens) the position follows it. */
+static void desk_settled(int have, double x, double y) {
+    if (have && (state == IDLE || state == DRIVEN) && ((x - px) * (x - px) + (y - py) * (y - py) > 1)) { px = x; py = y; }
+    ptr_defer_flush();
+}
+
+/* --- which desktop (15-desk.c) --- */
+static int64_t next_desk_check_ms, desk_other_since;
+static int desk_pick(void) {
+    if (!strcmp(want_desk, "weston")) return DESK_WESTON;
+    if (!strcmp(want_desk, "x11")) return DESK_X11;
+    return wd_socket_alive() ? DESK_WESTON : DESK_X11;
+}
+static void desk_switch(int k) {
+    logmsg("desktop: %s (was %s)", desk_name(k), desk_name(desk_kind));
+    if (wm_fd >= 0) wm_lost("the desktop changed");
+    desk_kind = k; ptr_defer.n = 0;
+    if (pfd >= 0) { release_all(); ioctl(pfd, UI_DEV_DESTROY); close(pfd); }
+    pfd = ui_create(k == DESK_WESTON ? 2 : 1);   /* the pointer device each desktop needs */
+    if (hsock >= 0) { kill(helper_pid, SIGTERM); helper_lost(); helper_restart_at = mono_ms(); }
+}
+/* Every 2 s, and when config.json changes. Without a choice in config.json: Weston once its module
+   answers (unless an X desktop is in use), X11 once it has not for 10 s. */
+static void desk_check(void) {
+    if (want_desk[0]) { int k = desk_pick(); if (k != desk_kind) desk_switch(k); return; }   /* chosen in config.json */
+    if (desk_kind == DESK_WESTON && wm_fd >= 0) { desk_other_since = 0; return; }   /* in use */
+    int k = desk_pick();
+    if (k == desk_kind) { desk_other_since = 0; return; }
+    if (!desk_other_since) desk_other_since = mono_ms();
+    if (k == DESK_WESTON && !x11_seen) desk_switch(k);
+    else if (k == DESK_X11 && wm_fd < 0 && mono_ms() - desk_other_since > 10000) desk_switch(k);
+}
+
 static void handle_helper(void) {
     static buf_t b; uint8_t t;
     if (hrecv(hsock, &t, &b)) { helper_lost(); return; }
-    if (t == 'Z' && b.n >= 8) { int32_t s[2]; memcpy(s, b.p, 8); if (s[0] > 0 && s[1] > 0) { scr_w = s[0]; scr_h = s[1]; } }
+    if (t == 'Z' && b.n >= 8) { int32_t s[2]; memcpy(s, b.p, 8); if (s[0] > 0 && s[1] > 0 && desk_kind == DESK_X11) { int r[4] = {0, 0, s[0], s[1]}; desk_layout(1, r); x11_seen = 1; } }
+    else if (t == 'D') wm_from_helper(b.p, b.n);
     else if (t == 'E') { set_error("%.*s", (int)b.n, b.p); tell_agent(0); }
     else if (t == 'K' && b.n) { cursor_hidden_here = b.p[0]; tell_agent(0); }
     else if (t == 'T' && asock >= 0) hsend(asock, 'T', b.p, b.n);
@@ -149,18 +203,12 @@ static void handle_helper(void) {
     }
     else if (t == 'X' && b.n >= 24) {
         int32_t r[6]; memcpy(r, b.p, 24); query_out = 0;
-        if (r[3] > 0 && r[4] > 0) { scr_w = r[3]; scr_h = r[4]; }
+        if (r[3] > 0 && r[4] > 0) { int o[4] = {0, 0, r[3], r[4]}; desk_layout(1, o); }
         int hold = state == IDLE || state == DRIVEN;
         /* the desktop's pointer, unless the peer's moves were injected meanwhile (they may not be
            applied yet: taking this answer would lose them); then ask again later */
         if ((r[5] == 1 || r[5] == 2) && hold) { if (injected_since_query) pos_dirty = 1; else { px = r[0]; py = r[1]; pos_dirty = 0; } }
-        if (r[5] == 1) {   /* this computer's mouse moved: on an edge, add the moves to the push */
-            double mx = loc_dx, my = loc_dy; loc_dx = loc_dy = 0;
-            if (hold && mono_ms() >= cooldown_ms && st.sharing && st.drives_peer && shm->peer_ip && !(r[2] & (DESK_LEFT | DESK_MIDDLE | DESK_RIGHT))) {
-                int e = pushed(r[0], r[1], mx, my);
-                if (e >= 0) hand_over(r[0], r[1], e);
-            } else push_reset();
-        }
+        if (r[5] == 1) local_edge(r[0], r[1], (unsigned)r[2]);
         if (r[5] == 3) { px = r[0]; py = r[1]; }
     }
     else if (t == 'k' && b.n >= 1 && pending_copy) { pending_copy = 0; local_combo(KEY_C, b.p[0]); hsend(hsock, 'C', NULL, 0); }
@@ -198,6 +246,11 @@ static int64_t next_deadline(void) {
         int64_t off = shm->peer_seen_ms + 40000; if (was_online && off < d) d = off;
     }
     if (forget_deadline && forget_deadline < d) d = forget_deadline;
+    if (ptr_defer.n && wm_warp_ms + 250 < d) d = wm_warp_ms + 250;
+    if (linked) {
+        if (next_desk_check_ms < d) d = next_desk_check_ms;
+        if (desk_kind == DESK_WESTON && wm_fd < 0 && wm_next_try < d) d = wm_next_try;
+    }
     return d;
 }
 static void timers(void) {
@@ -219,7 +272,10 @@ static void timers(void) {
         if (now - last_rx_ms >= 2000 && now >= stopping_grace_until) { stop_driving("no answer", 0, 0); claim = 1; set_error("%s stopped answering; the pointer is back here", lk.peer_name); }
         else if (now >= next_alive_ms) { uint8_t m = 0x1F; udp_send(&m, 1); next_alive_ms = now + 500; }
     }
+    if (ptr_defer.n && now - wm_warp_ms >= 250) ptr_defer_flush();   /* Weston did not answer the WARP in time */
     if (!linked) return;
+    if (now >= next_desk_check_ms) { next_desk_check_ms = now + 2000; desk_check(); }
+    if (desk_kind == DESK_WESTON && wm_fd < 0 && now >= wm_next_try) wm_connect();
     if (now >= next_ifscan_ms) {
         next_ifscan_ms = now + 10000;
         if (scan_ifaces()) { dsock_join(&pres); next_present_ms = now; logmsg("network changed"); }
@@ -259,23 +315,25 @@ static int conf_changed(int fd) {
 /* config.json changed: speed, modifier keys and display, applied without a restart. */
 static void reload_config(void) {
     char old_display[16]; snprintf(old_display, sizeof old_display, "%s", want_display);
-    want_display[0] = 0; load_config(); load_settings();
+    want_display[0] = want_desk[0] = 0; load_config(); load_settings();
     mod_keys(st.command_super ? "super" : "control", &cfg.cmd_l, &cfg.cmd_r); mod_keys(st.command_super ? "control" : "super", &cfg.ctl_l, &cfg.ctl_r);
     push_reset();
     logmsg("config.json changed: speed %.2f%s%s", cfg.speed, strcmp(old_display, want_display) ? ", desktop " : "", strcmp(old_display, want_display) ? (want_display[0] ? want_display : "(the main one)") : "");
     if (strcmp(old_display, want_display) && hsock >= 0) { kill(helper_pid, SIGTERM); helper_lost(); }   /* the helper reconnects to the chosen desktop */
+    if (linked) desk_check();
     tell_agent(0);
 }
 /* The virtual keyboard and pointer outlive restarts of the service (a link change): the compositor
    never sees them go and come back. They are destroyed only when the service really stops. */
 static int valid_fd(int fd) { return fd >= 0 && fcntl(fd, F_GETFD) != -1; }
 static void adopt_or_create_devices(void) {
-    const char *keep = getenv("SHENZHEN_KVM_UINPUT"); int k = -1, p = -1;
-    if (keep && sscanf(keep, "%d,%d", &k, &p) == 2 && valid_fd(k) && valid_fd(p)) {
+    const char *keep = getenv("SHENZHEN_KVM_UINPUT"); int k = -1, p = -1, kind = DESK_X11;
+    if (keep && sscanf(keep, "%d,%d,%d", &k, &p, &kind) >= 2 && valid_fd(k) && valid_fd(p)) {
         kfd = k; pfd = p; fcntl(kfd, F_SETFD, FD_CLOEXEC); fcntl(pfd, F_SETFD, FD_CLOEXEC);
         logmsg("kept the virtual keyboard and pointer");
+        if (kind != desk_kind) { ioctl(pfd, UI_DEV_DESTROY); close(pfd); pfd = ui_create(desk_kind == DESK_WESTON ? 2 : 1); }   /* another desktop now */
     } else {
-        kfd = ui_create(0); pfd = ui_create(1);
+        kfd = ui_create(0); pfd = ui_create(desk_kind == DESK_WESTON ? 2 : 1);
         if (kfd < 0 || pfd < 0) logmsg("cannot create virtual input devices: the keyboard and mouse can't be shared");
         usleep(300000);   /* let the compositor pick up the virtual devices */
     }
@@ -294,6 +352,8 @@ static int run(void) {
     inotify_add_watch(ino_conf, CONF_DIR, IN_CLOSE_WRITE | IN_MOVED_TO | IN_DELETE | IN_MOVED_FROM);
     inotify_add_watch(ino_conf, STATE_DIR, IN_CLOSE_WRITE | IN_MOVED_TO | IN_DELETE | IN_MOVED_FROM);
     signal(SIGTERM, on_sig); signal(SIGINT, on_sig);
+    desk_kind = desk_pick();
+    logmsg("desktop: %s%s", desk_name(desk_kind), want_desk[0] ? " (chosen in config.json)" : "");
     adopt_or_create_devices();
     if (linked) {
         shm->peer_dp = lk.peer_dp;
@@ -315,7 +375,7 @@ static int run(void) {
         logmsg("running: linked with %s, speed %.2f, ports %d-%d", lk.peer_name, cfg.speed, PORT_UDP, PORT_DISC);
     } else logmsg("not linked yet: waiting for a link (shenzhen-kvm visible, shenzhen-kvm link, or the tray app)");
     agent_start(); tell_agent(1);
-    struct pollfd q[8 + MAXDEV]; int restart = 0;
+    struct pollfd q[9 + MAXDEV]; int restart = 0;
     while (!quit && !restart) {
         int n = 0;
         q[n++] = (struct pollfd){udp, POLLIN, 0};
@@ -325,6 +385,7 @@ static int run(void) {
         q[n++] = (struct pollfd){asock, POLLIN, 0};
         q[n++] = (struct pollfd){kfd, POLLIN, 0};
         q[n++] = (struct pollfd){pres.s6, POLLIN, 0};
+        int wmi = -1; if (wm_fd >= 0) { wmi = n; q[n++] = (struct pollfd){wm_fd, wm_events(), 0}; }
         int base = n, map[MAXDEV];
         for (int i = 0; i < MAXDEV; i++) if (devs[i].fd > 0) { map[n - base] = i; q[n++] = (struct pollfd){devs[i].fd, POLLIN, 0}; }
         int64_t dl = next_deadline(), now = mono_ms();
@@ -341,6 +402,7 @@ static int run(void) {
                 for (int k = 0; k < MAXDEV; k++) if (devs[k].fd > 0 && devs[k].kbd) { struct input_event o[2] = {e[i], {.type = EV_SYN}}; write(devs[k].fd, o, sizeof o); }
         }
         if (q[6].revents & POLLIN) handle_present6();
+        if (wmi >= 0 && q[wmi].revents) wm_handle(q[wmi].revents);
         for (int i = base; i < n; i++) if (q[i].revents) { struct dev *d = &devs[map[i - base]]; if (q[i].revents & (POLLERR | POLLHUP)) dev_close(d); else handle_dev(d); }
         if ((state == DRIVEN || state == IDLE) && pos_dirty && !query_out && hsock >= 0) query(2);
         timers();
@@ -355,7 +417,7 @@ static int run(void) {
     if (hsock >= 0) { close(hsock); kill(helper_pid, SIGTERM); waitpid(helper_pid, NULL, 0); }
     if (asock >= 0) { close(asock); kill(agent_pid, SIGTERM); waitpid(agent_pid, NULL, 0); }
     if (restart && kfd >= 0 && pfd >= 0) {   /* the link changed: restart, handing the virtual devices over */
-        char keep[32]; snprintf(keep, sizeof keep, "%d,%d", kfd, pfd);
+        char keep[48]; snprintf(keep, sizeof keep, "%d,%d,%d", kfd, pfd, desk_kind);
         fcntl(kfd, F_SETFD, 0); fcntl(pfd, F_SETFD, 0); setenv("SHENZHEN_KVM_UINPUT", keep, 1);
         logmsg("the link changed: restarting (keeping the virtual keyboard and pointer)");
         execl("/proc/self/exe", "shenzhen-kvm", "run", (char *)NULL);
