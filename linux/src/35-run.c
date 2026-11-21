@@ -171,11 +171,12 @@ static void desk_switch(int k) {
    answers (unless an X desktop is in use), X11 once it has not for 10 s. */
 static void desk_check(void) {
     if (want_desk[0]) { int k = desk_pick(); if (k != desk_kind) desk_switch(k); return; }   /* chosen in config.json */
-    if (desk_kind == DESK_WESTON && wm_fd >= 0) { desk_other_since = 0; return; }   /* in use */
+    /* in use (and no probe: the module takes one client, a probe would replace the one it has) */
+    if ((desk_kind == DESK_WESTON && wm_fd >= 0) || (desk_kind == DESK_X11 && x11_seen)) { desk_other_since = 0; return; }
     int k = desk_pick();
     if (k == desk_kind) { desk_other_since = 0; return; }
     if (!desk_other_since) desk_other_since = mono_ms();
-    if (k == DESK_WESTON && !x11_seen) desk_switch(k);
+    if (k == DESK_WESTON) desk_switch(k);
     else if (k == DESK_X11 && wm_fd < 0 && mono_ms() - desk_other_since > 10000) desk_switch(k);
 }
 
