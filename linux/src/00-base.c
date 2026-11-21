@@ -48,11 +48,8 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <sodium.h>
-#include <X11/Xatom.h>
-#include <X11/Xlib.h>
-#include <X11/Xutil.h>
 
-static char CONF_DIR[256] = "/etc/shenzhen-kvm";            /* config.json: edge, speed, modifier keys */
+static char CONF_DIR[256] = "/etc/shenzhen-kvm";            /* config.json: speed, modifier keys, display */
 static char STATE_DIR[256] = "/var/lib/shenzhen-kvm";       /* id, link, settings.json */
 static char RUN_DIR[256] = "/run/shenzhen-kvm";             /* control.sock */
 static char CONF_FILE[300], ID_FILE[300], LINK_FILE[300], SETTINGS_FILE[300], CONTROL_SOCK[300], HELD_FILE[300];

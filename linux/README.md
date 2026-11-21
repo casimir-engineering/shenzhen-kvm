@@ -7,9 +7,11 @@ Both follow `../PROTOCOL.md`.
 ## What a person sees
 
 - **One pointer.** The pointer is on one screen at a time, and both computers' keyboards and mice
-  act there, from wherever the pointer is. Push it past the side of the screen that leads to the other
-  computer (no button held, with either mouse) and it carries on there at the same place along the
-  edge; the screen it left hides its pointer. Both Shift keys bring it back to the computer whose
+  act there, from wherever the pointer is. Push it past any edge of the screen (with either mouse) and
+  it carries on on the other computer, coming in at the opposite edge at the same place along it; the
+  screen it left hides its pointer. It doesn't cross while a button is held (dragging a window to an
+  edge stays here), near a corner, or when it just reaches an edge and stops there: it takes a
+  deliberate push. Both Shift keys bring it back to the computer whose
   keyboard you're using. The Mac's ⌘ acts as Control (⌘C copies),
   or as Super (a setting); ⌘Tab switches windows here (Alt+Tab, held while ⌘ is held), ⌃Tab stays
   Control+Tab, and the Mac's volume and playback keys work here.
@@ -26,8 +28,8 @@ Both follow `../PROTOCOL.md`.
   when the service isn't running, with a small green dot while one computer's keyboard and mouse are
   in use on the other. Its menu says where the mouse
   is and lists transfers; **Open Shenzhen KVM…** opens the window: sharing on/off, linking (make this
-  computer visible, the computers that are visible, the code to compare, forgetting the link), which
-  side the other computer's screen is on, the clipboard settings and the transfers with their progress.
+  computer visible, the computers that are visible, the code to compare, forgetting the link), the
+  clipboard settings and the transfers with their progress.
   The settings are shared with the other computer's window.
 - While the pointer is on the other computer, this computer's pointer is hidden and its keyboard and
   mice act there; it shows again when the pointer comes back.
@@ -49,7 +51,7 @@ As root, from a copy of this repository: `linux/install.sh`. It builds with this
 | the service | `/usr/local/bin/shenzhen-kvm`, `shenzhen-kvm.service` (enabled, started) |
 | the top-bar app | `/usr/local/bin/shenzhen-kvm-tray`, started with the desktop through `/etc/xdg/autostart/shenzhen-kvm-tray.desktop`, also in the applications menu |
 | icons | `/usr/share/icons/hicolor/<size>/apps/shenzhen-kvm.png` |
-| this computer's settings | `/etc/shenzhen-kvm/config.json`: `edge` until the first shared settings arrive, `speed` (multiplier for the other computer's pointer here) |
+| this computer's settings | `/etc/shenzhen-kvm/config.json`: `speed` (multiplier for the other computer's pointer here), `display` (which desktop) |
 
 and keeps backups with an undo script (`/var/lib/shenzhen-kvm/undo.sh`, or `install.sh --undo`).
 An earlier install of this service under another name (a systemd unit that runs `…kvm-share run`) is
@@ -92,6 +94,10 @@ They work for root and for the person who owns the desktop (the user running the
   computer while it drives it; mice are held only while driving the other computer.
 - The X server and its auth file are found from the X server's command line (`Xwayland`, `Xorg`, `X`
   or `Xvfb`); the desktop's user is the owner of that process. A desktop restart is followed.
+  Everything the service asks of the desktop (where the pointer is, the screen size, hiding the
+  pointer, the clipboard, whether a terminal has focus) goes through the `desk_*` functions in
+  `src/15-desk.c`; `src/16-desk-x11.c` implements them for X11, and a Wayland backend would implement
+  the same functions.
 - Files: `/var/lib/shenzhen-kvm/id` (this computer's id), `link` (the linked computer and its key,
   mode 0600), `settings.json` (the shared settings, from this computer's side). None of them belongs in
   a disk image: each computer makes its own id, and is linked by its person.

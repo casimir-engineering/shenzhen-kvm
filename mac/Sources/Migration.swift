@@ -51,7 +51,6 @@ enum Migration {
             var c = Config()
             c.apply(local: j)
             if let v = j["speed"] as? Double { c.speed = v }
-            if let v = j["push"] as? Double { c.push = v }
             if let v = j["smooth"] as? Bool { c.smooth = v }
             if let v = j["copy_key"] as? [Int], v.count == 2 { c.copyKey = Shortcut(vk: UInt16(v[0]), flags: UInt64(v[1])) }
             if let v = j["paste_key"] as? [Int], v.count == 2 { c.pasteKey = Shortcut(vk: UInt16(v[0]), flags: UInt64(v[1])) }

@@ -41,7 +41,9 @@ final class Core {
     var peerOnline = false
     var peerName = ""
     var tapOK = false
-    private var push = 0.0
+    private var push = 0.0, pushEdge: Edge?, pushAt = 0.0   // PROTOCOL.md Edges
+    private var exitEdge: Edge = .top                        // the edge the pointer last left through
+    private static let crossPush = 400.0, pushGap = 0.3, cornerZone: CGFloat = 40
     private var enterSince = 0.0, enterLast = 0.0, enterPos: UInt16 = 0, enterFailAt = -10.0
     private var lastPeer = 0.0, lastAlive = 0.0, aliveSentAt = 0.0
     private var savedPos: UInt16 = 0
@@ -58,7 +60,6 @@ final class Core {
 
     // driven-side state
     private var vpos = CGPoint.zero
-    private var drivenEdge: Edge = .top
     private var buttons: Set<UInt8> = []
     private var keysDown: Set<UInt16> = []   // mapped HID usages
     private var flags: UInt64 = 0           // device + generic modifier bits
@@ -183,6 +184,23 @@ final class Core {
     private func pushAmount(_ dx: Double, _ dy: Double, _ e: Edge) -> Double {
         switch e { case .top: return -dy; case .bottom: return dy; case .left: return -dx; case .right: return dx }
     }
+    /// PROTOCOL.md Edges: adds this move (by dx, dy to p, no button held) to the outward push and
+    /// returns the edge to cross once the push is enough. Called with the lock held.
+    private func pushed(_ p: CGPoint, _ dx: Double, _ dy: Double) -> Edge? {
+        let now = mono(), last = pushAt
+        pushAt = now
+        guard let d = displays.first(where: { $0.insetBy(dx: -0.5, dy: -0.5).contains(p) }),
+              let e = Edge.allCases.first(where: { pushAmount(dx, dy, $0) > 0 && atOuterEdge(p, $0) }) else { push = 0; pushEdge = nil; return nil }
+        let across = e == .top || e == .bottom
+        let out = pushAmount(dx, dy, e), along = abs(across ? dx : dy)
+        let a = across ? p.x - d.minX : p.y - d.minY, b = across ? d.maxX - 1 - p.x : d.maxY - 1 - p.y
+        if a < Self.cornerZone || b < Self.cornerZone || along > 2 * out { push = 0; pushEdge = nil; return nil }
+        if pushEdge != e || now - last > Self.pushGap { push = 0 }
+        pushEdge = e; push += out
+        guard push >= Self.crossPush else { return nil }
+        push = 0; pushEdge = nil
+        return e
+    }
     private func posAlong(_ p: CGPoint, _ e: Edge) -> UInt16 {
         let u = union
         let f = (e == .top || e == .bottom) ? (p.x - u.minX) / max(u.width - 1, 1) : (p.y - u.minY) / max(u.height - 1, 1)
@@ -287,16 +305,11 @@ final class Core {
             let p = ev.location
             let dx = Double(ev.getIntegerValueField(.mouseEventDeltaX)), dy = Double(ev.getIntegerValueField(.mouseEventDeltaY))
             os_unfair_lock_lock(&L)
-            let e = cfg.edge
-            let now = mono()
-            if atOuterEdge(p, e), pushAmount(dx, dy, e) > 0 {
-                push += pushAmount(dx, dy, e)
-                if push >= cfg.push, m == .idle || m == .driven, now - enterFailAt > 1.0 {
-                    os_unfair_lock_unlock(&L)
-                    crossOut(at: p)
-                    return pass
-                }
-            } else if !atOuterEdge(p, e) { push = 0 }
+            if let e = pushed(p, dx, dy), m == .idle || m == .driven, mono() - enterFailAt > 1.0 {
+                os_unfair_lock_unlock(&L)
+                crossOut(at: p, edge: e)
+                return pass
+            }
             os_unfair_lock_unlock(&L)
             return pass
         default:
@@ -304,14 +317,15 @@ final class Core {
         }
     }
 
-    /// The pointer was pushed past the edge at p: ask the other computer to take it (ENTER).
-    func crossOut(at p: CGPoint) {
+    /// The pointer was pushed past `edge` at p: ask the other computer to take it (ENTER), at its
+    /// opposite edge.
+    func crossOut(at p: CGPoint, edge: Edge) {
         guard locked({ !cfg.paused && cfg.macDrivesPeer && peerIP != nil && mono() - enterFailAt > 1.0 }) else { return }
         if locked({ mode == .driven }) { endDriven(why: "the pointer crossed to the other computer") }
         let sm = locked { () -> Bool? in
             guard mode == .idle else { return nil }
             let now = mono(); mode = .entering; enterSince = now; enterLast = now
-            enterPos = posAlong(p, cfg.edge); savedPos = enterPos
+            exitEdge = edge; enterPos = posAlong(p, edge); savedPos = enterPos
             return cfg.smooth
         }
         guard let sm else { return }
@@ -332,7 +346,7 @@ final class Core {
     }
 
     private func sendEnter() {
-        let (e, p) = locked { (cfg.edge.opposite, enterPos) }
+        let (e, p) = locked { (exitEdge.opposite, enterPos) }
         var b: [UInt8] = [0x01, e.wire]; b.u16(p)
         send(b)
     }
@@ -443,7 +457,7 @@ final class Core {
             let w = mode
             if w == .driving { mode = .idle; push = 0; claim = true }
             if sendLeave && w == .driving { let now = mono(); leavePending = (0, now, now) }
-            let t = pos.map { pointAt(entry ?? cfg.edge, $0, inset: 1) } ?? clamp(parkedAt)
+            let t = pos.map { pointAt(entry ?? exitEdge, $0, inset: 1) } ?? clamp(parkedAt)
             if w == .driving { vpos = t }
             return (w, t)
         }
@@ -513,7 +527,7 @@ final class Core {
                 switch t {
                 case 0x01:
                     guard let e = r.u8(), let pos = r.u16() else { break }
-                    onEnter(Edge(wire: e) ?? cfg.edge, pos, from)
+                    onEnter(Edge(wire: e) ?? exitEdge, pos, from)
                 case 0x02:
                     guard let a = r.u8() else { break }
                     onAck(a)
@@ -569,7 +583,7 @@ final class Core {
             guard !cfg.paused && cfg.peerDrivesMac else { return nil }
             if mode == .driven { return false }
             guard mode == .idle else { return nil }
-            mode = .driven; drivenEdge = cfg.edge; lastPeer = mono(); push = 0; vpos = here
+            mode = .driven; lastPeer = mono(); push = 0; vpos = here
             buttons = []; keysDown = []; rawDown = []; switcher = nil; flags = 0; scrollAcc = (0, 0)
             return true
         }
@@ -609,7 +623,7 @@ final class Core {
         if (m == .driven || m == .idle) && mono() - locked({ heldSince }) < 1.5 { return }   // a repeat of the ENTER that gave it
         if m == .driving { stopDriving(sendLeave: false, pos: pos, why: "the pointer came back", entry: e) }
         let p = locked { () -> CGPoint in
-            mode = .driven; drivenEdge = e; lastPeer = mono(); push = 0; heldSince = mono(); claim = true
+            mode = .driven; lastPeer = mono(); push = 0; heldSince = mono(); claim = true
             buttons = []; keysDown = []; rawDown = []; switcher = nil; flags = 0; scrollAcc = (0, 0)
             vpos = pointAt(e, pos, inset: 1)
             return vpos
@@ -618,7 +632,7 @@ final class Core {
         post(mouse: .mouseMoved, at: p, dx: 0, dy: 0)
         DispatchQueue.main.async { self.onChange?() }
         if locked({ cfg.smooth }) { awdl.sync(want: true, force: true) }
-        log("the pointer is on this Mac (from \(otherComputer()))")
+        log("the pointer is on this Mac (from \(otherComputer()), in through the \(e.rawValue) edge)")
     }
 
     // MARK: driven side (inject)
@@ -639,7 +653,7 @@ final class Core {
     }
 
     private func drivenMove(_ dx0: Double, _ dy0: Double) {
-        var leavePos: UInt16?
+        var leave: Edge?
         // From where the pointer is: our own running position while only the other computer's mouse
         // moves it (events just posted may not be applied yet, so reading the pointer back would lose
         // moves), the real position once this Mac's own mouse moved it or after a pause.
@@ -649,12 +663,10 @@ final class Core {
             let now = mono()
             let base = localMoved || now - lastPostAt > 0.3 ? real : vpos
             localMoved = false; lastPostAt = now
-            vpos = clamp(CGPoint(x: base.x + dx, y: base.y + dy))
-            let e = cfg.edge
-            if buttons.isEmpty, atOuterEdge(vpos, e), pushAmount(dx, dy, e) > 0 {
-                push += pushAmount(dx, dy, e)
-                if push >= cfg.push { leavePos = posAlong(vpos, e) }
-            } else if !atOuterEdge(vpos, e) { push = 0 }
+            let want = CGPoint(x: base.x + dx, y: base.y + dy)
+            vpos = clamp(want)
+            // outward: only what goes past the edge counts
+            if buttons.isEmpty { leave = pushed(vpos, vpos.x != want.x ? Double(want.x - vpos.x) : dx, vpos.y != want.y ? Double(want.y - vpos.y) : dy) } else { push = 0 }
             let t: CGEventType, b: CGMouseButton
             if buttons.contains(1) { t = .leftMouseDragged; b = .left }
             else if buttons.contains(2) { t = .rightMouseDragged; b = .right }
@@ -663,7 +675,7 @@ final class Core {
             return (vpos, t, b, dx, dy)
         }
         post(mouse: type, at: p, dx: dx, dy: dy, button: btn)
-        if leavePos != nil { crossOut(at: p) }   // pushed past the edge by the other computer's mouse: hand over
+        if let leave { crossOut(at: p, edge: leave) }   // pushed past the edge by the other computer's mouse: hand over
     }
 
     private func drivenButton(_ b: UInt8, _ down: Bool) {
@@ -1014,7 +1026,6 @@ final class Core {
         }
     }
 
-    func setEdge(_ e: Edge) { update { $0.edge = e } }
 
     /// Change settings, save, and tell the other computer.
     func update(_ f: (inout Config) -> Void) {

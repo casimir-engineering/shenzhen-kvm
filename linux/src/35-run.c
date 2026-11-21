@@ -108,8 +108,8 @@ static void tell_agent(int force) {
 }
 static void diag_json(buf_t *b) {
     uint64_t avg = lat_n ? lat_sum_ns / lat_n / 1000 : 0;
-    bprintf(b, "{\"state\": \"%s\", \"pointer\": [%d, %d], \"screen\": [%d, %d], \"edge\": \"%s\", \"speed\": %.2f, \"inject_us\": {\"count\": %llu, \"avg\": %llu, \"max\": %llu}, \"net_ms\": {\"moves\": %llu, ",
-            STATE_NAMES[state], (int)px, (int)py, scr_w, scr_h, EDGE_NAMES[cfg.edge], cfg.speed, (unsigned long long)lat_n, (unsigned long long)avg, (unsigned long long)(lat_max_ns / 1000), (unsigned long long)net_moves);
+    bprintf(b, "{\"state\": \"%s\", \"pointer\": [%d, %d], \"screen\": [%d, %d], \"speed\": %.2f, \"inject_us\": {\"count\": %llu, \"avg\": %llu, \"max\": %llu}, \"net_ms\": {\"moves\": %llu, ",
+            STATE_NAMES[state], (int)px, (int)py, scr_w, scr_h, cfg.speed, (unsigned long long)lat_n, (unsigned long long)avg, (unsigned long long)(lat_max_ns / 1000), (unsigned long long)net_moves);
     char t[1024]; int k = net_json(t, sizeof t, "arrival_gap", net_arr); bput(b, t, k); bputs(b, ", ");
     k = net_json(t, sizeof t, "delay_above_min", net_late); bput(b, t, k); bputs(b, "}}");
 }
@@ -119,7 +119,7 @@ static void settings_applied(int tell_peer) {
     mod_keys(st.command_super ? "super" : "control", &cfg.cmd_l, &cfg.cmd_r); mod_keys(st.command_super ? "control" : "super", &cfg.ctl_l, &cfg.ctl_r);
     if ((!st.sharing || !st.peer_drives) && (state == DRIVEN || state == LEAVING)) end_driven("switched off");
     if ((!st.sharing || !st.drives_peer) && state == DRIVING) { send_leave(0); stop_driving("switched off", 0, 0); }
-    edge_pushes = 0;
+    push_reset();
     if (hsock >= 0) {
         send_local_settings(hsock);
         if (tell_peer) { buf_t b = {0}; settings_json(&b, 1); hsend(hsock, 'S', b.p, b.n); bfree(&b); settings_sent_ms = mono_ms(); }
@@ -154,11 +154,12 @@ static void handle_helper(void) {
         /* the desktop's pointer, unless the peer's moves were injected meanwhile (they may not be
            applied yet: taking this answer would lose them); then ask again later */
         if ((r[5] == 1 || r[5] == 2) && hold) { if (injected_since_query) pos_dirty = 1; else { px = r[0]; py = r[1]; pos_dirty = 0; } }
-        if (r[5] == 1 && hold && mono_ms() >= cooldown_ms && st.sharing && st.drives_peer && shm->peer_ip) {
-            int at = (cfg.edge == 0 && r[0] <= 0) || (cfg.edge == 1 && r[0] >= scr_w - 1) || (cfg.edge == 2 && r[1] <= 0) || (cfg.edge == 3 && r[1] >= scr_h - 1);
-            if (at && !(r[2] & (Button1Mask | Button2Mask | Button3Mask))) {
-                if (++edge_pushes >= 2) hand_over(r[0], r[1]);
-            } else edge_pushes = 0;
+        if (r[5] == 1) {   /* this computer's mouse moved: on an edge, add the moves to the push */
+            double mx = loc_dx, my = loc_dy; loc_dx = loc_dy = 0;
+            if (hold && mono_ms() >= cooldown_ms && st.sharing && st.drives_peer && shm->peer_ip && !(r[2] & (DESK_LEFT | DESK_MIDDLE | DESK_RIGHT))) {
+                int e = pushed(r[0], r[1], mx, my);
+                if (e >= 0) hand_over(r[0], r[1], e);
+            } else push_reset();
         }
         if (r[5] == 3) { px = r[0]; py = r[1]; }
     }
@@ -210,7 +211,7 @@ static void timers(void) {
         else if (now >= next_leave_ms) { send_leave(0); next_leave_ms = now + 200; }
     }
     if (state == ENTERING) {
-        if (now >= deadline_ms) { state = IDLE; cooldown_ms = now + 1000; set_error("%s did not answer when the pointer reached the %s edge", lk.peer_name, EDGE_NAMES[cfg.edge]); }
+        if (now >= deadline_ms) { state = IDLE; cooldown_ms = now + 1000; set_error("%s did not answer when the pointer reached the %s edge", lk.peer_name, EDGE_NAMES[exit_edge]); }
         else if (now >= next_retx_ms) { send_enter(); next_retx_ms = now + 200; }
     } else if (state == DRIVEN) {
         if (now - last_rx_ms >= 2000) { end_driven("no packet for 2 s"); set_error("%s went silent while its keyboard was in use here; keys released", lk.peer_name); }
@@ -255,13 +256,13 @@ static int conf_changed(int fd) {
         }
     return hit;
 }
-/* config.json changed: edge, speed, modifier keys and display, applied without a restart. */
+/* config.json changed: speed, modifier keys and display, applied without a restart. */
 static void reload_config(void) {
     char old_display[16]; snprintf(old_display, sizeof old_display, "%s", want_display);
     want_display[0] = 0; load_config(); load_settings();
     mod_keys(st.command_super ? "super" : "control", &cfg.cmd_l, &cfg.cmd_r); mod_keys(st.command_super ? "control" : "super", &cfg.ctl_l, &cfg.ctl_r);
-    edge_pushes = 0;
-    logmsg("config.json changed: edge %s, speed %.2f%s%s", EDGE_NAMES[cfg.edge], cfg.speed, strcmp(old_display, want_display) ? ", desktop " : "", strcmp(old_display, want_display) ? (want_display[0] ? want_display : "(the main one)") : "");
+    push_reset();
+    logmsg("config.json changed: speed %.2f%s%s", cfg.speed, strcmp(old_display, want_display) ? ", desktop " : "", strcmp(old_display, want_display) ? (want_display[0] ? want_display : "(the main one)") : "");
     if (strcmp(old_display, want_display) && hsock >= 0) { kill(helper_pid, SIGTERM); helper_lost(); }   /* the helper reconnects to the chosen desktop */
     tell_agent(0);
 }
@@ -311,7 +312,7 @@ static int run(void) {
         char hb[32];   /* stopped with the pointer here less than 60 s ago: start with the claim */
         if (read_small(HELD_FILE, hb, sizeof hb) > 0 && (long long)(now_us() / 1000000) - atoll(hb) < 60) { claim = 1; logmsg("the pointer stays here (it was here before the restart)"); }
         unlink(HELD_FILE);
-        logmsg("running: linked with %s, edge %s, speed %.2f, ports %d-%d", lk.peer_name, EDGE_NAMES[cfg.edge], cfg.speed, PORT_UDP, PORT_DISC);
+        logmsg("running: linked with %s, speed %.2f, ports %d-%d", lk.peer_name, cfg.speed, PORT_UDP, PORT_DISC);
     } else logmsg("not linked yet: waiting for a link (shenzhen-kvm visible, shenzhen-kvm link, or the tray app)");
     agent_start(); tell_agent(1);
     struct pollfd q[8 + MAXDEV]; int restart = 0;

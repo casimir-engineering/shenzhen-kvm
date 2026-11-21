@@ -12,13 +12,15 @@ static dsock_t pres = {-1, -1, 0};   /* presence of the linked peer: the input p
 static uint64_t rx_high;
 static int scr_w = 3440, scr_h = 1440;
 static double px, py;                 /* tracked pointer position (driven) */
-static int entry_edge;
+static int exit_edge;                 /* the edge the pointer last left through */
 static int injected_down[KEY_CNT];    /* keys held on the virtual keyboard */
 static int btn_down[8];
 static double wheel_acc_y, wheel_acc_x;
 static int64_t last_rx_ms, next_retx_ms, deadline_ms, next_alive_ms, cooldown_ms, last_query_ms;
 static uint16_t enter_pos;
-static int query_out, pos_dirty, edge_pushes, injected_since_query;
+static int query_out, pos_dirty, injected_since_query;
+static double loc_dx, loc_dy;          /* this computer's mouse moves since the last edge query */
+static int64_t loc_at;
 static char last_error[256] = "";
 static int64_t last_peer_seen_ms = -1;
 static uint64_t lat_n, lat_sum_ns, lat_max_ns, lat_hist[12];  /* <25,50,100,200,500us,1,2,5,10,20,50ms,more */
@@ -142,7 +144,7 @@ static void udp_send_to(struct sockaddr_in *to, const uint8_t *m, size_t n) {
 }
 static void udp_send(const uint8_t *m, size_t n) { struct sockaddr_in a; if (peer_sockaddr(&a, shm->peer_dp) == 0) udp_send_to(&a, m, n); }
 static void send_ack(uint8_t t, struct sockaddr_in *to) { uint8_t m[2] = {0x02, t}; udp_send_to(to, m, 2); }
-static void send_enter(void) { uint8_t m[4] = {0x01, (uint8_t)(cfg.edge ^ 1)}; put16(m + 2, enter_pos); udp_send(m, 4); }
+static void send_enter(void) { uint8_t m[4] = {0x01, (uint8_t)(exit_edge ^ 1)}; put16(m + 2, enter_pos); udp_send(m, 4); }
 static void send_leave(uint16_t pos) { uint8_t m[3] = {0x03}; put16(m + 1, pos); udp_send(m, 3); }
 static void send_key_mac(unsigned usage, int down) {
     if (!usage || usage > 255) return;
@@ -161,6 +163,27 @@ static void edge_point(int edge, uint16_t pos, int inset, double *x, double *y) 
     case 2: *x = f * (scr_w - 1); *y = inset; break;
     default: *x = f * (scr_w - 1); *y = scr_h - 1 - inset; break;
     }
+}
+
+/* PROTOCOL.md Edges: adds a move (dx, dy, no button held) that left the pointer at x, y to the
+   outward push; returns the edge to cross once the push is enough, else -1. */
+#define CROSS_PUSH 400.0
+#define PUSH_GAP_MS 300
+#define CORNER_ZONE 40
+static int push_edge = -1; static double push_amt; static int64_t push_at;
+static void push_reset(void) { push_edge = -1; push_amt = 0; }
+static int pushed(double x, double y, double dx, double dy) {
+    int64_t now = mono_ms(), last = push_at; push_at = now;
+    int e = x <= 0 && dx < 0 ? 0 : x >= scr_w - 1 && dx > 0 ? 1 : y <= 0 && dy < 0 ? 2 : y >= scr_h - 1 && dy > 0 ? 3 : -1;
+    if (e < 0) { push_reset(); return -1; }
+    double out = e == 0 ? -dx : e == 1 ? dx : e == 2 ? -dy : dy;
+    double along = e >= 2 ? (dx < 0 ? -dx : dx) : (dy < 0 ? -dy : dy);
+    double a = e >= 2 ? x : y, b = e >= 2 ? scr_w - 1 - x : scr_h - 1 - y;   /* to the corners along the edge */
+    if (a < CORNER_ZONE || b < CORNER_ZONE || along > 2 * out) { push_reset(); return -1; }
+    if (e != push_edge || now - last > PUSH_GAP_MS) push_amt = 0;
+    push_edge = e; push_amt += out;
+    if (push_amt < CROSS_PUSH) return -1;
+    push_reset(); return e;
 }
 
 static void query(uint8_t tag) { if (hsock >= 0 && !query_out) { query_out = 1; injected_since_query = 0; last_query_ms = mono_ms(); hsend(hsock, 'Q', &tag, 1); } }
@@ -188,9 +211,9 @@ static void stop_driving(const char *why, int have_pos, uint16_t pos) {
     if (state != DRIVING) return;
     for (int u = 1; u < 256; u++) if (mac_down[u]) send_key_mac(u, 0);
     grab_mice(0);
-    state = IDLE; cooldown_ms = mono_ms() + 400; edge_pushes = 0;
+    state = IDLE; cooldown_ms = mono_ms() + 400; push_reset();
     double x, y;
-    if (have_pos) { edge_point(cfg.edge, pos, 1, &x, &y); place_pointer(x, y); }
+    if (have_pos) { edge_point(exit_edge, pos, 1, &x, &y); place_pointer(x, y); }
     else place_pointer(park_x, park_y);   /* back where it was hidden */
     tell_here();
     logmsg("the pointer is back here: %s", why);
@@ -200,17 +223,18 @@ static int holding(void) {
     if (!st.sharing || !st.peer_drives) return 0;
     if (state == DRIVEN) return 1;
     if (state != IDLE) return 0;
-    release_all(); state = DRIVEN; entry_edge = cfg.edge; wheel_acc_x = wheel_acc_y = 0;
+    release_all(); state = DRIVEN; wheel_acc_x = wheel_acc_y = 0;
     pos_dirty = 1;   /* where the pointer really is, in case it moved without this computer's mice */
     logmsg("%s's keyboard and mouse act here", lk.peer_name);
     return 1;
 }
-/* The pointer was pushed past the edge here (by either mouse): hand it to the peer (ENTER). */
-static void hand_over(double x, double y) {
+/* The pointer was pushed past `edge` here (by either mouse): hand it to the peer (ENTER), which
+   takes it in at its opposite edge. */
+static void hand_over(double x, double y, int edge) {
     if (!st.sharing || !st.drives_peer || !shm->peer_ip || mono_ms() < cooldown_ms) return;
     if (state == DRIVEN) release_all();
     if (state != IDLE && state != DRIVEN) return;
-    enter_pos = pos_along(cfg.edge, x, y); edge_pushes = 0;
+    exit_edge = edge; enter_pos = pos_along(edge, x, y); push_reset();
     state = ENTERING; send_enter(); next_retx_ms = mono_ms() + 200; deadline_ms = mono_ms() + 1000;
 }
 
@@ -305,7 +329,7 @@ static void handle_udp(void) {
                 send_ack(0x01, &src);
                 if ((state == DRIVEN || state == IDLE) && mono_ms() - held_since_ms < 1500) continue;   /* a repeat of the ENTER that gave it */
                 if (state == DRIVING) stop_driving("it came back", 1, pos);
-                release_all(); state = DRIVEN; entry_edge = edge; wheel_acc_x = wheel_acc_y = 0; held_since_ms = mono_ms(); claim = 1;
+                release_all(); state = DRIVEN; wheel_acc_x = wheel_acc_y = 0; held_since_ms = mono_ms(); claim = 1;
                 double x, y; edge_point(edge, pos, 0, &x, &y); place_pointer(x, y);
                 logmsg("the pointer is here (from %s, in through the %s edge)", lk.peer_name, EDGE_NAMES[edge]);
             } else if (t == 0x02 && i + 2 <= ml) {   /* ACK */
@@ -322,14 +346,15 @@ static void handle_udp(void) {
                 if (!holding()) continue;
                 double nx = px + dx * cfg.speed, ny = py + dy * cfg.speed;
                 int nob = !btn_down[1] && !btn_down[2] && !btn_down[3];
-                int out = (cfg.edge == 0 && nx < 0) || (cfg.edge == 1 && nx > scr_w - 1) || (cfg.edge == 2 && ny < 0) || (cfg.edge == 3 && ny > scr_h - 1);
-                if (out && nob && st.drives_peer) {   /* pushed past the edge by the peer's mouse: hand over */
-                    double cx = nx < 0 ? 0 : nx > scr_w - 1 ? scr_w - 1 : nx, cy = ny < 0 ? 0 : ny > scr_h - 1 ? scr_h - 1 : ny;
-                    place_pointer(cx, cy); hand_over(cx, cy);
+                double cx = nx < 0 ? 0 : nx > scr_w - 1 ? scr_w - 1 : nx, cy = ny < 0 ? 0 : ny > scr_h - 1 ? scr_h - 1 : ny;
+                int out = -1;
+                /* outward: only what goes past the edge counts */
+                if (!nob) push_reset(); else if (st.drives_peer) out = pushed(cx, cy, nx != cx ? nx - cx : dx * cfg.speed, ny != cy ? ny - cy : dy * cfg.speed);
+                if (out >= 0) {   /* pushed past an edge by the peer's mouse: hand over */
+                    place_pointer(cx, cy); hand_over(cx, cy, out);
                     continue;
                 }
-                px = nx; py = ny;
-                if (px < 0) px = 0; if (py < 0) py = 0; if (px > scr_w - 1) px = scr_w - 1; if (py > scr_h - 1) py = scr_h - 1;
+                px = cx; py = cy;
                 ev(EV_ABS, ABS_X, (int)(((int64_t)(int)px * 65536 + 32768) / scr_w));
                 ev(EV_ABS, ABS_Y, (int)(((int64_t)(int)py * 65536 + 32768) / scr_h));
                 moved = 1; injected_since_query = 1;
@@ -412,10 +437,6 @@ static void flush_motion(struct dev *d) {
     d->dx = d->dy = d->wx = d->wy = 0;
 }
 
-static int toward_edge(int dx, int dy) {
-    switch (cfg.edge) { case 0: return dx < 0; case 1: return dx > 0; case 2: return dy < 0; default: return dy > 0; }
-}
-
 static void handle_dev(struct dev *d) {
     struct input_event e[64];
     ssize_t n = read(d->fd, e, sizeof e);
@@ -469,9 +490,12 @@ static void handle_dev(struct dev *d) {
                 pos_dirty = 1;
             }
             int64_t now = mono_ms();
-            if (hold && now >= cooldown_ms && !(d->btns & 0x0E) && toward_edge(dx, dy) && hsock >= 0) {
+            /* edges: ask where the pointer is now; the answer adds these moves to the push */
+            if (hold && !(d->btns & 0x0E) && hsock >= 0) {
+                if (now - loc_at > PUSH_GAP_MS) loc_dx = loc_dy = 0;
+                loc_dx += dx; loc_dy += dy; loc_at = now;
                 if (!query_out && now - last_query_ms >= 8) query(1);
-            } else if (hold && !toward_edge(dx, dy)) edge_pushes = 0;
+            } else if (hold) { push_reset(); loc_dx = loc_dy = 0; }
         }
     }
 }

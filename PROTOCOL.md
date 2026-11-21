@@ -123,8 +123,8 @@ the **holder**, the other is the **remote**.
   and mouse input, including the shortcuts its system keeps for itself (the Mac reads keys at the HID
   level), and sends it to the holder. So any mouse or keyboard, on either computer, acts on the screen
   that has the pointer.
-- Only the holder moves the pointer across the edge, whichever mouse pushed it there: when its
-  pointer is pushed past the edge that leads to the other computer (no button held), it hands the
+- Only the holder moves the pointer across an edge, whichever mouse pushed it there: when its
+  pointer is pushed past any outer edge of its screen space (see Edges), it hands the
   pointer over with ENTER and, once it has the ACK, becomes the remote. The holder therefore
   arbitrates when both mice move at once: their movements add up on its screen, and one crossing
   happens or none.
@@ -199,7 +199,7 @@ Plaintext = u8 type + body.
 | 0x23 | CLIP_DATA | u8 kind (0 empty, 1 text, 2 image, 3 files) then: text = UTF-8; image = PNG bytes; files = u16 count, then per file: u16 name length, UTF-8 relative path (folders are sent as their files, paths keep the folder name), u64 size, bytes |
 | 0x24 | CLIP_PENDING | u64 total bytes. "Files were copied here and are on their way"; a FILES_BEGIN follows on another connection. 0 = the transfer was abandoned. Reply: ACK |
 | 0x25 | CLIP_SKIPPED | u64 total bytes, u64 limit bytes. Files were copied here but are over the size limit and are not sent (so the other side can say so). Reply: ACK |
-| 0x26 | SETTINGS | UTF-8 JSON from the sender's side, sent by either computer when a setting changes in its window (or command line) and when it finds its peer. Reply: ACK. Keys: `sharing` (all of it on/off), `i_drive_you` (the sender's keyboard and mouse may control the receiver), `you_drive_me`, `clipboard`, `usual_shortcuts` (true: shared clipboard below; false: the dedicated shortcuts), `big_files`, `file_limit_mb`, `my_edge` (the sender's edge that leads to the receiver: the receiver's is its opposite), `command_as` (`control` or `super`: what a Mac's Command key acts as on Linux; the Mac's Control is then the other one), `changed` (ms since 1970 of the change). The newest change wins: the receiver adopts the settings when `changed` is newer than its own, and otherwise answers with its own SETTINGS. Both keep them across restarts |
+| 0x26 | SETTINGS | UTF-8 JSON from the sender's side, sent by either computer when a setting changes in its window (or command line) and when it finds its peer. Reply: ACK. Keys: `sharing` (all of it on/off), `i_drive_you` (the sender's keyboard and mouse may control the receiver), `you_drive_me`, `clipboard`, `usual_shortcuts` (true: shared clipboard below; false: the dedicated shortcuts), `big_files`, `file_limit_mb`, `command_as` (`control` or `super`: what a Mac's Command key acts as on Linux; the Mac's Control is then the other one), `changed` (ms since 1970 of the change). The newest change wins: the receiver adopts the settings when `changed` is newer than its own, and otherwise answers with its own SETTINGS. Both keep them across restarts. (`my_edge`, sent by versions before 1.0.5, is ignored) |
 | 0x27 | FILES_BEGIN | Files in pieces (every file transfer). u16 count, then per file: u16 name length, UTF-8 relative path, u64 size. It is the first frame on its connection; FILES_DATA frames follow on the same connection, then the receiver writes the files, puts them on its clipboard and replies ACK (0x02 0x27); it closes the connection without an ACK if it fails |
 | 0x28 | FILES_DATA | raw bytes, at most 1 MiB per frame: the files' contents back to back, in the order of FILES_BEGIN. Each frame is sealed on its own; both sides measure progress from these frames |
 | 0x29 | FORGET | none. "The person forgot this link here": the receiver forgets it too. Reply: ACK |
@@ -254,7 +254,18 @@ The shortcut keys themselves are swallowed and never forwarded.
 
 ## Edges
 
-Each peer names which edge of ITS whole screen space (all its screens together, outer boundary
-only) leads to the other peer, e.g. Mac `edge = "top"`, Linux `edge = "bottom"`. Crossing happens
-when the pointer is pushed against that outer boundary and no mouse button is held (so dragging a
-window to the edge never crosses). Inner boundaries between a computer's own screens never cross.
+Every outer edge of a computer's screen space is a way to the other computer: there is no setting for
+where the other screen is. The screen space is all of that computer's displays together; an edge
+shared by two of its own displays never crosses. The pointer leaves through an edge and enters the
+other computer through the OPPOSITE edge of its screen space (left ↔ right, top ↔ bottom), at the same
+place along it (`pos`, 0..65535 from left to right or top to bottom). Coming back works the same way,
+through any edge.
+
+The holder hands the pointer over (ENTER) only when all of these hold, whichever mouse moves it:
+- no mouse button is held (dragging a window, a file or a selection to an edge never crosses);
+- the pointer is not within 40 px (along the edge) of a corner of the display it is on, so hot corners
+  and the corner buttons of menu bars and panels work as usual;
+- it keeps being pushed outward past that edge: the outward movement while it stays on the edge adds
+  up to 400 px (in the pointer's own units), with no pause longer than 0.3 s; leaving the edge,
+  pausing, or a movement that mostly runs along the edge (sliding across a menu bar) starts over. Reaching the menu bar, the Dock or a panel and stopping there, or overshooting a
+  little, never crosses.

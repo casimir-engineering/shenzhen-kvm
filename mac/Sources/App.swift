@@ -42,9 +42,7 @@ final class MainWindow: NSObject, NSWindowDelegate, NSTextFieldDelegate {
     // settings
     private let macDrives = NSButton(checkboxWithTitle: "", target: nil, action: nil)
     private let peerDrives = NSButton(checkboxWithTitle: "", target: nil, action: nil)
-    private let side = NSPopUpButton()
-    private let sideLabel = label("")
-    private let sideHint = label("", size: 11, secondary: true)
+    private let edgeHint = label("", size: 11, secondary: true)
     private let commandLabel = label("")
     private let command = NSPopUpButton()
     private var commandRow: NSStackView!
@@ -80,8 +78,6 @@ final class MainWindow: NSObject, NSWindowDelegate, NSTextFieldDelegate {
         for b in [macDrives, peerDrives, clipboard, usual, bigFiles, smooth] { b.target = self; b.action = #selector(changed(_:)) }
         sharing.target = self; sharing.action = #selector(changed(_:))
         permission.target = self; permission.action = #selector(openAX); permission.bezelStyle = .rounded
-        side.addItems(withTitles: ["above this Mac", "below this Mac", "to the left of this Mac", "to the right of this Mac"])
-        side.target = self; side.action = #selector(changed(_:))
         command.addItems(withTitles: ["Control (⌘C copies)", "Super"])
         command.target = self; command.action = #selector(changed(_:))
         copyKeyButton.target = self; copyKeyButton.action = #selector(record(_:)); copyKeyButton.bezelStyle = .rounded
@@ -106,7 +102,7 @@ final class MainWindow: NSObject, NSWindowDelegate, NSTextFieldDelegate {
         commandRow = row([commandLabel, command])
         keyRows = [row([label("Copy here and send to the other computer:"), copyKeyButton]),
                    row([label("Paste what the other computer copied:"), pasteKeyButton])]
-        settingsViews = [macDrives, peerDrives, row([sideLabel, side]), sideHint, commandRow, line(), clipboard, usual] + keyRows + [bigFiles, limitRow, notice, line()]
+        settingsViews = [macDrives, peerDrives, edgeHint, commandRow, line(), clipboard, usual] + keyRows + [bigFiles, limitRow, notice, line()]
 
         let views: [NSView] = [head, status, permission, line(),
             linkTitle, linkHelp, visibleButton, visibleRow, visibleHint, foundTitle, foundBox, linkingRow, linkedRow, line()]
@@ -172,15 +168,13 @@ final class MainWindow: NSObject, NSWindowDelegate, NSTextFieldDelegate {
         // settings
         macDrives.title = "This Mac's keyboard and mouse can control \(other)"
         peerDrives.title = "\(Other)'s keyboard and mouse can control this Mac"
-        sideLabel.stringValue = "\(Other)'s screen is"
-        sideHint.stringValue = "Move the pointer past that side of your screens to go to \(other); it comes back the same way."
+        edgeHint.stringValue = "Push the pointer past any edge of your screens to go to \(other); it comes in on the opposite side there. To come back, push it past any edge of \(other)'s screen."
         commandLabel.stringValue = "On \(other), this Mac's ⌘ key acts as"
         commandRow.isHidden = !linked || os == "mac"
         command.selectItem(at: c.commandSuper ? 1 : 0)
         sharing.state = c.paused ? .off : .on
         macDrives.state = c.macDrivesPeer ? .on : .off
         peerDrives.state = c.peerDrivesMac ? .on : .off
-        side.selectItem(at: [Edge.top, .bottom, .left, .right].firstIndex(of: c.edge) ?? 0)
         clipboard.state = c.clipboard ? .on : .off
         usual.state = c.usualShortcuts ? .on : .off
         copyKeyButton.title = c.copyKey.title; pasteKeyButton.title = c.pasteKey.title
@@ -189,7 +183,7 @@ final class MainWindow: NSObject, NSWindowDelegate, NSTextFieldDelegate {
         limitRow.isHidden = !linked || c.bigFiles || !c.clipboard
         if limit.currentEditor() == nil { limit.stringValue = "\(c.fileLimitMB)" }
         notice.stringValue = note; notice.isHidden = !linked || note.isEmpty
-        for v in [macDrives, peerDrives, side, command, clipboard, usual, bigFiles] { v.isEnabled = !c.paused && (v !== usual && v !== bigFiles || c.clipboard) }
+        for v in [macDrives, peerDrives, command, clipboard, usual, bigFiles] { v.isEnabled = !c.paused && (v !== usual && v !== bigFiles || c.clipboard) }
         refreshTransfers()
         smooth.state = c.smooth ? .on : .off
         smooth.isEnabled = core.awdl.installed
@@ -297,13 +291,10 @@ final class MainWindow: NSObject, NSWindowDelegate, NSTextFieldDelegate {
     }
 
     @objc private func changed(_ sender: Any) {
-        let e: [Edge] = [.top, .bottom, .left, .right]
-        let idx = side.indexOfSelectedItem
         core.update {
             $0.paused = sharing.state == .off
             $0.macDrivesPeer = macDrives.state == .on
             $0.peerDrivesMac = peerDrives.state == .on
-            if idx >= 0 { $0.edge = e[idx] }
             $0.commandSuper = command.indexOfSelectedItem == 1
             $0.clipboard = clipboard.state == .on
             $0.usualShortcuts = usual.state == .on
@@ -404,7 +395,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Updater.shared.start()
         if showAtLaunch || core.link == nil || migrated { win.show() }
         if migrated { Migration.explain(over: win.window) }
-        log("started; \(core.link.map { "linked with \($0.peerName)" } ?? "not linked"), edge \(core.cfg.edge.rawValue), ports \(portBase)-\(discPort)")
+        log("started; \(core.link.map { "linked with \($0.peerName)" } ?? "not linked"), ports \(portBase)-\(discPort)")
     }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { win.show(); return true }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }

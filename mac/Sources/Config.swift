@@ -84,9 +84,7 @@ struct Link {
 }
 
 struct Config {
-    var edge: Edge = .top        // the side of this Mac's screens where the other computer's screen is
     var speed = 1.0
-    var push = 20.0              // pixels pushed against the edge before crossing
     var paused = false
     var smooth = true            // pause AirDrop/Handoff (awdl0) while sharing
     var macDrivesPeer = true
@@ -106,7 +104,6 @@ struct Config {
               let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return c }
         c.apply(local: j)
         if let v = j["speed"] as? Double { c.speed = v }
-        if let v = j["push"] as? Double { c.push = v }
         if let v = j["smooth"] as? Bool { c.smooth = v }
         if let v = j["changed"] as? Int64 { c.changed = v } else if let v = j["changed"] as? Int { c.changed = Int64(v) }
         if let v = j["copy_key"] as? [Int], v.count == 2 { c.copyKey = Shortcut(vk: UInt16(v[0]), flags: UInt64(v[1])) }
@@ -115,7 +112,6 @@ struct Config {
     }
 
     mutating func apply(local j: [String: Any]) {
-        if let v = j["edge"] as? String, let e = Edge(rawValue: v) { edge = e }
         if let v = j["paused"] as? Bool { paused = v }
         if let v = j["mac_drives_peer"] as? Bool { macDrivesPeer = v }
         if let v = j["peer_drives_mac"] as? Bool { peerDrivesMac = v }
@@ -127,7 +123,7 @@ struct Config {
     }
 
     func save() {
-        let j: [String: Any] = ["edge": edge.rawValue, "speed": speed, "push": push, "paused": paused, "smooth": smooth,
+        let j: [String: Any] = ["speed": speed, "paused": paused, "smooth": smooth,
                                 "mac_drives_peer": macDrivesPeer, "peer_drives_mac": peerDrivesMac,
                                 "clipboard": clipboard, "usual_shortcuts": usualShortcuts, "big_files": bigFiles,
                                 "file_limit_mb": fileLimitMB, "command_as": commandSuper ? "super" : "control", "changed": changed,
@@ -142,13 +138,13 @@ struct Config {
     var wireJSON: [UInt8] {
         let j: [String: Any] = ["sharing": !paused, "i_drive_you": macDrivesPeer, "you_drive_me": peerDrivesMac,
                                 "clipboard": clipboard, "usual_shortcuts": usualShortcuts, "big_files": bigFiles,
-                                "file_limit_mb": fileLimitMB, "my_edge": edge.rawValue, "command_as": commandSuper ? "super" : "control",
+                                "file_limit_mb": fileLimitMB, "command_as": commandSuper ? "super" : "control",
                                 "changed": changed]
         return Array(try! JSONSerialization.data(withJSONObject: j, options: [.sortedKeys]))
     }
 
     /// The shared values (not when they changed), to tell a real change from a repeat.
-    var sharedValues: String { "\(paused)\(macDrivesPeer)\(peerDrivesMac)\(clipboard)\(usualShortcuts)\(bigFiles)\(fileLimitMB)\(edge)\(commandSuper)" }
+    var sharedValues: String { "\(paused)\(macDrivesPeer)\(peerDrivesMac)\(clipboard)\(usualShortcuts)\(bigFiles)\(fileLimitMB)\(commandSuper)" }
     enum Adoption { case older, changed, same }
     /// SETTINGS from the peer: adopted when newer.
     mutating func adopt(wire j: [String: Any]) -> Adoption {
@@ -162,7 +158,6 @@ struct Config {
         if let v = j["usual_shortcuts"] as? Bool { usualShortcuts = v }
         if let v = j["big_files"] as? Bool { bigFiles = v }
         if let v = j["file_limit_mb"] as? Int, v > 0 { fileLimitMB = v }
-        if let v = j["my_edge"] as? String, let e = Edge(rawValue: v) { edge = e.opposite }
         if let v = j["command_as"] as? String { commandSuper = v == "super" }
         changed = ch != 0 ? ch : Int64(Date().timeIntervalSince1970 * 1000)
         return sharedValues == before ? .same : .changed

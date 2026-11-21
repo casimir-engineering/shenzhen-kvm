@@ -543,12 +543,6 @@ class App:
         self.i_drive.connect("toggled", lambda c: self.set_setting("i_drive_peer", c.get_active()))
         self.peer_drives = wrap_check()
         self.peer_drives.connect("toggled", lambda c: self.set_setting("peer_drives_me", c.get_active()))
-        self.edge = Gtk.ComboBoxText()
-        for k, t in (("top", "above this computer"), ("bottom", "below this computer"),
-                     ("left", "to the left of this computer"), ("right", "to the right of this computer")):
-            self.edge.append(k, t)
-        self.edge.connect("changed", lambda c: c.get_active_id() and self.set_setting("edge", c.get_active_id()))
-        self.edge_label = label(wrap=False)
         self.edge_hint = label(secondary=True, small=True)
         self.command = Gtk.ComboBoxText()
         self.command.append("control", "Control (⌘C copies)")
@@ -571,7 +565,7 @@ class App:
         self.limit.connect("focus-out-event", lambda e, ev: self.apply_limit() and False)
         self.limit_row = hbox(label("Files bigger than", wrap=False), self.limit, label("MB are not sent.", wrap=False))
         self.limit_row.set_margin_start(26)
-        for w in (self.i_drive, self.peer_drives, hbox(self.edge_label, self.edge), self.edge_hint,
+        for w in (self.i_drive, self.peer_drives, self.edge_hint,
                   hbox(self.command_label, self.command), Gtk.Separator(),
                   self.clipboard, self.usual, self.keys_hint, self.big, self.limit_row):
             self.settings.pack_start(w, False, False, 0)
@@ -738,14 +732,12 @@ class App:
             self.settings.set_sensitive(sharing_on)
             self.i_drive._label.set_text("This computer's keyboard and mouse can control %s" % p.mid)
             self.peer_drives._label.set_text("%s's keyboard and mouse can control this computer" % p.start)
-            set_text(self.edge_label, "%s's screen is" % p.start)
-            set_text(self.edge_hint, "Move the pointer past that side of your screen to go to %s; it comes back the same way." % p.mid)
+            set_text(self.edge_hint, "Push the pointer past any edge of your screen to go to %s; it comes in on the opposite side there. "
+                                     "To come back, push it past any edge of %s's screen." % (p.mid, p.mid))
             set_text(self.command_label, "%s's ⌘ key acts here as" % p.start)
             set_text(self.keys_hint, "Ctrl+Shift+C copies here and sends to %s; Ctrl+Shift+V pastes what %s copied." % (p.mid, p.mid))
             self.i_drive.set_active(bool(s.get("i_drive_peer", True)))
             self.peer_drives.set_active(bool(s.get("peer_drives_me", True)))
-            if self.edge.get_active_id() != s.get("edge"):
-                self.edge.set_active_id(s.get("edge") or "top")
             if self.command.get_active_id() != s.get("command_as"):
                 self.command.set_active_id(s.get("command_as") or "control")
             clip = bool(s.get("clipboard", True))

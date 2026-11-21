@@ -1,12 +1,11 @@
 /* ---------- config (/etc/shenzhen-kvm/config.json: this computer only) ---------- */
 static struct {
-    int edge;               /* 0 left 1 right 2 top 3 bottom: this screen's edge that leads to the peer */
     double speed;
     int cmd_l, cmd_r;       /* evdev keys for the Mac's Command */
     int ctl_l, ctl_r;       /* evdev keys for the Mac's Control */
 } cfg;
 static char want_display[16];         /* config.json "display": which desktop (default: the lowest-numbered) */
-static const char *EDGE_NAMES[] = {"left", "right", "top", "bottom"};
+static const char *EDGE_NAMES[] = {"left", "right", "top", "bottom"};   /* 0..3, as on the wire; ^1 = opposite */
 
 static void mod_keys(const char *v, int *l, int *r) {
     if (!strcmp(v, "super")) { *l = KEY_LEFTMETA; *r = KEY_RIGHTMETA; }
@@ -14,10 +13,9 @@ static void mod_keys(const char *v, int *l, int *r) {
     else { *l = KEY_LEFTCTRL; *r = KEY_RIGHTCTRL; }
 }
 static void load_config(void) {
-    cfg.edge = 3; cfg.speed = 1.0;
+    cfg.speed = 1.0;
     char cmd[16] = "control", ctl[16] = "super", v[64], j[8192];
     if (read_small(CONF_FILE, j, sizeof j) > 0) {
-        if (json_str(j, "edge", v, sizeof v)) for (int i = 0; i < 4; i++) if (!strcmp(v, EDGE_NAMES[i])) cfg.edge = i;
         if (json_str(j, "speed", v, sizeof v) && atof(v) > 0.05 && atof(v) < 20) cfg.speed = atof(v);
         if (json_str(j, "mac_command", v, sizeof v)) snprintf(cmd, sizeof cmd, "%s", v);
         if (json_str(j, "mac_control", v, sizeof v)) snprintf(ctl, sizeof ctl, "%s", v);
@@ -28,17 +26,17 @@ static void load_config(void) {
 
 /* ---------- settings shared by both computers (PROTOCOL.md SETTINGS) ----------
    Kept from this computer's side in settings.json; the newest change wins on both. */
-static struct { int sharing, peer_drives, drives_peer, clipboard, usual, big_files; long limit_mb; int64_t changed; int edge_set; int command_super; } st = {1, 1, 1, 1, 1, 1, 100, 0, 0, 0};
+static struct { int sharing, peer_drives, drives_peer, clipboard, usual, big_files; long limit_mb; int64_t changed; int command_super; } st = {1, 1, 1, 1, 1, 1, 100, 0, 0};
 static int64_t wall_ms(void) { return (int64_t)(now_us() / 1000); }
 static void settings_json(buf_t *b, int wire) {
     if (wire)   /* from the sender's side */
-        bprintf(b, "{\"sharing\": %s, \"i_drive_you\": %s, \"you_drive_me\": %s, \"clipboard\": %s, \"usual_shortcuts\": %s, \"big_files\": %s, \"file_limit_mb\": %ld, \"my_edge\": \"%s\", \"command_as\": \"%s\", \"changed\": %lld}",
+        bprintf(b, "{\"sharing\": %s, \"i_drive_you\": %s, \"you_drive_me\": %s, \"clipboard\": %s, \"usual_shortcuts\": %s, \"big_files\": %s, \"file_limit_mb\": %ld, \"command_as\": \"%s\", \"changed\": %lld}",
                 st.sharing ? "true" : "false", st.drives_peer ? "true" : "false", st.peer_drives ? "true" : "false", st.clipboard ? "true" : "false",
-                st.usual ? "true" : "false", st.big_files ? "true" : "false", st.limit_mb, EDGE_NAMES[cfg.edge], st.command_super ? "super" : "control", (long long)st.changed);
+                st.usual ? "true" : "false", st.big_files ? "true" : "false", st.limit_mb, st.command_super ? "super" : "control", (long long)st.changed);
     else
-        bprintf(b, "{\"sharing\": %s, \"peer_drives_me\": %s, \"i_drive_peer\": %s, \"clipboard\": %s, \"usual_shortcuts\": %s, \"big_files\": %s, \"file_limit_mb\": %ld, \"edge\": \"%s\", \"command_as\": \"%s\", \"changed\": %lld}",
+        bprintf(b, "{\"sharing\": %s, \"peer_drives_me\": %s, \"i_drive_peer\": %s, \"clipboard\": %s, \"usual_shortcuts\": %s, \"big_files\": %s, \"file_limit_mb\": %ld, \"command_as\": \"%s\", \"changed\": %lld}",
                 st.sharing ? "true" : "false", st.peer_drives ? "true" : "false", st.drives_peer ? "true" : "false", st.clipboard ? "true" : "false",
-                st.usual ? "true" : "false", st.big_files ? "true" : "false", st.limit_mb, EDGE_NAMES[cfg.edge], st.command_super ? "super" : "control", (long long)st.changed);
+                st.usual ? "true" : "false", st.big_files ? "true" : "false", st.limit_mb, st.command_super ? "super" : "control", (long long)st.changed);
 }
 static void save_settings(void) { buf_t b = {0}; settings_json(&b, 0); bputs(&b, "\n"); mkdirs(STATE_DIR, 0700); write_file_atomic(SETTINGS_FILE, b.p, b.n, 0600); bfree(&b); }
 static void parse_local_settings(const char *j) {
@@ -47,13 +45,12 @@ static void parse_local_settings(const char *j) {
     st.clipboard = json_bool(j, "clipboard", 1); st.usual = json_bool(j, "usual_shortcuts", 1); st.big_files = json_bool(j, "big_files", 1);
     st.limit_mb = json_long(j, "file_limit_mb", 100); if (st.limit_mb <= 0) st.limit_mb = 100;
     st.changed = json_long(j, "changed", 0);
-    if (json_str(j, "edge", v, sizeof v)) for (int i = 0; i < 4; i++) if (!strcmp(v, EDGE_NAMES[i])) { cfg.edge = i; st.edge_set = 1; }
     if (json_str(j, "command_as", v, sizeof v)) st.command_super = !strcmp(v, "super");
 }
 static void load_settings(void) { char j[4096]; if (read_small(SETTINGS_FILE, j, sizeof j) > 0) parse_local_settings(j); }
 /* The values of the settings (not when they changed), to tell a real change from a repeat. */
 static void settings_values(char *out, size_t n) {
-    snprintf(out, n, "%d%d%d%d%d%d%ld/%d/%d", st.sharing, st.peer_drives, st.drives_peer, st.clipboard, st.usual, st.big_files, st.limit_mb, cfg.edge, st.command_super);
+    snprintf(out, n, "%d%d%d%d%d%d%ld/%d", st.sharing, st.peer_drives, st.drives_peer, st.clipboard, st.usual, st.big_files, st.limit_mb, st.command_super);
 }
 /* Settings from the peer: 0 = ours are newer, 1 = newer and something changed, 2 = newer but the
    same values (nothing to apply). */
@@ -65,7 +62,6 @@ static int settings_from_peer(const char *j) {
     st.drives_peer = json_bool(j, "you_drive_me", st.drives_peer); st.clipboard = json_bool(j, "clipboard", st.clipboard);
     st.usual = json_bool(j, "usual_shortcuts", st.usual); st.big_files = json_bool(j, "big_files", st.big_files);
     long l = json_long(j, "file_limit_mb", st.limit_mb); if (l > 0) st.limit_mb = l;
-    if (json_str(j, "my_edge", v, sizeof v)) for (int i = 0; i < 4; i++) if (!strcmp(v, EDGE_NAMES[i])) { cfg.edge = i ^ 1; st.edge_set = 1; }
     if (json_str(j, "command_as", v, sizeof v)) st.command_super = !strcmp(v, "super");
     st.changed = ch ? ch : wall_ms();
     settings_values(after, sizeof after);
@@ -80,7 +76,6 @@ static int settings_from_local(const char *j) {
     st.drives_peer = json_bool(j, "i_drive_peer", st.drives_peer); st.clipboard = json_bool(j, "clipboard", st.clipboard);
     st.usual = json_bool(j, "usual_shortcuts", st.usual); st.big_files = json_bool(j, "big_files", st.big_files);
     long l = json_long(j, "file_limit_mb", st.limit_mb); if (l > 0) st.limit_mb = l;
-    if (json_str(j, "edge", v, sizeof v)) for (int i = 0; i < 4; i++) if (!strcmp(v, EDGE_NAMES[i])) { cfg.edge = i; st.edge_set = 1; }
     if (json_str(j, "command_as", v, sizeof v)) st.command_super = !strcmp(v, "super");
     settings_values(after, sizeof after);
     if (!strcmp(before, after)) return 0;
